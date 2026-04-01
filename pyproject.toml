@@ -1,0 +1,145 @@
+[project]
+name = "atcode"
+version = "0.1.0"
+description = "AI-Powered Code Knowledge Graph and Documentation System"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    "loguru>=0.7.3",
+    "pydantic-settings>=2.0.0",
+    "pymgclient>=1.4.0",
+    "python-dotenv>=1.1.0",
+    "toml>=0.10.2",
+    "tree-sitter-python>=0.23.6",
+    "tree-sitter==0.25.0",
+    "watchdog>=6.0.0",
+    "gitpython>=3.1.0",
+    "typer>=0.12.5",
+    "rich>=13.7.1",
+    "prompt-toolkit>=3.0.0",
+    "click>=8.0.0",
+    "langchain-core>=1.2.7",
+    "filelock>=3.20.3",
+    "langgraph>=1.0.7",
+    "langchain-openai>=1.1.7",
+    "gunicorn>=24.1.1; sys_platform != 'win32'",
+    "httpx[socks]>=0.28.1",
+]
+
+[build-system]
+requires = ["setuptools>=75.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "backend"}
+packages = ["agent", "api", "core", "graph", "parser", "graph.sync", "atlas_mcp"]
+
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.4.1",
+    "pytest-asyncio>=1.0.0",
+]
+dev = [
+    "ruff>=0.5.5",
+    "mypy>=1.11.0",
+    "pre-commit>=4.2.0",
+]
+
+# MCP Server support
+mcp = [
+    "mcp>=1.0.0",
+    "httpx>=0.27.0",
+    "fastmcp>=2.0.0",
+]
+
+# Gemini / Vertex AI support
+google = [
+    "langchain-google-genai>=2.0.0",
+    "langchain-google-vertexai>=2.0.0",
+]
+
+# Phase 2: FastAPI service dependencies
+fastapi = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "python-multipart>=0.0.12",
+]
+
+# Phase 2: Redis cache support
+redis = [
+    "redis>=5.2.0",
+]
+
+# Phase 2: Full production deployment
+production = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "python-multipart>=0.0.12",
+    "redis>=5.2.0",
+    "gunicorn>=23.0.0; sys_platform != 'win32'",
+]
+
+# Paper reading feature
+paper = [
+    "httpx>=0.27.0",
+    "markdownify>=0.14.1",
+    "PyMuPDF>=1.24.0",
+]
+
+treesitter-full = [
+    "tree-sitter-python>=0.23.6",
+    "tree-sitter-javascript>=0.23.1",
+    "tree-sitter-typescript>=0.23.2",
+    "tree-sitter-rust>=0.24.0",
+    "tree-sitter-go>=0.23.4",
+    "tree-sitter-scala>=0.24.0",
+    "tree-sitter-java>=0.23.5",
+    "tree-sitter-cpp>=0.23.0",
+    "tree-sitter-lua>=0.0.19",
+]
+
+# Self-hosted embedding with local models (optional, heavy dependencies ~10GB+)
+# Only needed if you want to run embedding models locally instead of using API-based embedding
+semantic = [
+    "qdrant-client>=1.9.0",
+    "torch>=2.6.0",
+    "transformers>=4.0.0",
+]
+
+# All features except semantic (recommended for most users)
+all = [
+    "atcode[fastapi,redis,mcp,google,paper,treesitter-full,production,test,dev]",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]
+norecursedirs = ["grammars", ".git", "__pycache__", "*.egg-info", ".venv", "venv"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.14.1",
+    "types-toml>=0.10.8.20240310",
+]

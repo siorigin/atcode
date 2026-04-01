@@ -1,0 +1,31 @@
+services:
+  memgraph:
+    image: "${DOCKER_IMAGE_PREFIX:-}memgraph/memgraph-mage"
+    ports:
+      - "${MEMGRAPH_PORT:-7687}:7687"
+      - "${MEMGRAPH_HTTP_PORT:-7444}:7444"
+    restart: unless-stopped
+
+  lab:
+    image: "${DOCKER_IMAGE_PREFIX:-}memgraph/lab"
+    profiles: ["lab"]
+    ports:
+      - "${LAB_PORT:-3000}:3000"
+    environment:
+      QUICK_CONNECT_MG_HOST: memgraph
+    depends_on:
+      - memgraph
+
+  redis:
+    image: "${DOCKER_IMAGE_PREFIX:-}redis:latest"
+    ports:
+      - "6379:6379"
+    volumes:
+      - "${REDIS_DATA_DIR:-../data/redis}:/data"
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5

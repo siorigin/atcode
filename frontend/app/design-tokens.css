@@ -1,0 +1,350 @@
+/**
+ * AtCode Design Tokens
+ *
+ * A unified design system for consistent UI/UX across the application.
+ * Based on 8px grid system with 1.25 typographic scale.
+ *
+ * Usage: Import this file in globals.css or layout.tsx
+ */
+
+:root {
+  /* ========================================
+     TYPOGRAPHY SCALE (1.25 Major Second)
+     ======================================== */
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+
+  /* Font Sizes */
+  --text-xs: 0.6875rem;    /* 11px - captions, badges */
+  --text-sm: 0.8125rem;    /* 13px - secondary text */
+  --text-base: 1rem;       /* 16px - body text */
+  --text-lg: 1.25rem;      /* 20px - subheadings */
+  --text-xl: 1.5625rem;    /* 25px - headings */
+  --text-2xl: 1.9375rem;   /* 31px - titles */
+  --text-3xl: 2.4375rem;   /* 39px - hero text */
+
+  /* Line Heights */
+  --leading-none: 1;
+  --leading-tight: 1.25;
+  --leading-snug: 1.375;
+  --leading-normal: 1.5;
+  --leading-relaxed: 1.625;
+  --leading-loose: 1.75;
+
+  /* Letter Spacing */
+  --tracking-tighter: -0.02em;
+  --tracking-tight: -0.01em;
+  --tracking-normal: 0;
+  --tracking-wide: 0.025em;
+  --tracking-wider: 0.05em;
+
+  /* Font Weights */
+  --font-normal: 400;
+  --font-medium: 500;
+  --font-semibold: 600;
+  --font-bold: 700;
+
+  /* ========================================
+     SPACING SCALE (8px base)
+     ======================================== */
+  --space-0: 0;
+  --space-px: 1px;
+  --space-0-5: 0.125rem;   /* 2px */
+  --space-1: 0.25rem;      /* 4px */
+  --space-1-5: 0.375rem;   /* 6px */
+  --space-2: 0.5rem;       /* 8px */
+  --space-2-5: 0.625rem;   /* 10px */
+  --space-3: 0.75rem;      /* 12px */
+  --space-3-5: 0.875rem;   /* 14px */
+  --space-4: 1rem;         /* 16px */
+  --space-5: 1.25rem;      /* 20px */
+  --space-6: 1.5rem;       /* 24px */
+  --space-7: 1.75rem;      /* 28px */
+  --space-8: 2rem;         /* 32px */
+  --space-9: 2.25rem;      /* 36px */
+  --space-10: 2.5rem;      /* 40px */
+  --space-12: 3rem;        /* 48px */
+  --space-14: 3.5rem;      /* 56px */
+  --space-16: 4rem;        /* 64px */
+  --space-20: 5rem;        /* 80px */
+
+  /* ========================================
+     BORDER RADIUS
+     ======================================== */
+  --radius-none: 0;
+  --radius-sm: 6px;        /* buttons, tags, badges */
+  --radius-md: 10px;       /* inputs, small cards */
+  --radius-lg: 14px;       /* cards, panels */
+  --radius-xl: 20px;       /* modals, feature cards */
+  --radius-2xl: 24px;      /* large modals */
+  --radius-full: 9999px;   /* pills, avatars */
+
+  /* ========================================
+     SHADOWS
+     ======================================== */
+  /* Dark theme shadows */
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.24);
+  --shadow-sm: 0 2px 4px rgba(0, 0, 0, 0.24);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.28);
+  --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.32);
+  --shadow-xl: 0 24px 48px rgba(0, 0, 0, 0.36);
+  --shadow-2xl: 0 32px 64px rgba(0, 0, 0, 0.4);
+
+  /* Glow effects */
+  --shadow-glow-sm: 0 0 12px rgba(88, 166, 255, 0.2);
+  --shadow-glow-md: 0 0 20px rgba(88, 166, 255, 0.25);
+  --shadow-glow-lg: 0 0 32px rgba(88, 166, 255, 0.3);
+
+  /* Inset shadows */
+  --shadow-inner: inset 0 2px 4px rgba(0, 0, 0, 0.2);
+
+  /* ========================================
+     TRANSITIONS & ANIMATIONS
+     ======================================== */
+  /* Durations */
+  --duration-instant: 50ms;
+  --duration-fast: 150ms;
+  --duration-normal: 250ms;
+  --duration-slow: 400ms;
+  --duration-slower: 600ms;
+
+  /* Easing Functions */
+  --ease-linear: linear;
+  --ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --ease-out: cubic-bezier(0, 0, 0.2, 1);
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-bounce: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --ease-smooth: cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* Common Transitions */
+  --transition-colors: color var(--duration-fast) var(--ease-out),
+                       background-color var(--duration-fast) var(--ease-out),
+                       border-color var(--duration-fast) var(--ease-out);
+  --transition-opacity: opacity var(--duration-fast) var(--ease-out);
+  --transition-transform: transform var(--duration-normal) var(--ease-smooth);
+  --transition-all: all var(--duration-normal) var(--ease-smooth);
+
+  /* ========================================
+     Z-INDEX SCALE
+     ======================================== */
+  --z-base: 0;
+  --z-dropdown: 50;
+  --z-sticky: 100;
+  --z-fixed: 150;
+  --z-modal-backdrop: 200;
+  --z-modal: 250;
+  --z-popover: 300;
+  --z-tooltip: 400;
+  --z-toast: 500;
+
+  /* ========================================
+     BREAKPOINTS (for reference)
+     ======================================== */
+  --breakpoint-sm: 640px;
+  --breakpoint-md: 768px;
+  --breakpoint-lg: 1024px;
+  --breakpoint-xl: 1280px;
+  --breakpoint-2xl: 1536px;
+
+  /* ========================================
+     LAYOUT
+     ======================================== */
+  --container-sm: 640px;
+  --container-md: 768px;
+  --container-lg: 1024px;
+  --container-xl: 1280px;
+  --container-2xl: 1400px;
+
+  /* Gap scale for grids */
+  --gap-xs: var(--space-2);
+  --gap-sm: var(--space-3);
+  --gap-md: var(--space-4);
+  --gap-lg: var(--space-6);
+  --gap-xl: var(--space-8);
+}
+
+/* ========================================
+   COMPONENT TOKENS
+   ======================================== */
+
+/* Button Tokens */
+:root {
+  --btn-height-xs: 28px;
+  --btn-height-sm: 32px;
+  --btn-height-md: 40px;
+  --btn-height-lg: 48px;
+  --btn-height-xl: 56px;
+
+  --btn-padding-xs: var(--space-1-5) var(--space-2-5);
+  --btn-padding-sm: var(--space-2) var(--space-3);
+  --btn-padding-md: var(--space-2-5) var(--space-4);
+  --btn-padding-lg: var(--space-3) var(--space-5);
+
+  --btn-font-size-sm: var(--text-xs);
+  --btn-font-size-md: var(--text-sm);
+  --btn-font-size-lg: var(--text-base);
+
+  --btn-radius: var(--radius-md);
+  --btn-font-weight: var(--font-medium);
+}
+
+/* Input Tokens */
+:root {
+  --input-height-sm: 36px;
+  --input-height-md: 44px;
+  --input-height-lg: 52px;
+
+  --input-padding-x: var(--space-4);
+  --input-padding-y: var(--space-3);
+
+  --input-font-size: var(--text-base);
+  --input-radius: var(--radius-md);
+  --input-border-width: 2px;
+}
+
+/* Card Tokens */
+:root {
+  --card-padding-sm: var(--space-4);
+  --card-padding-md: var(--space-6);
+  --card-padding-lg: var(--space-8);
+
+  --card-radius: var(--radius-lg);
+  --card-border-width: 1px;
+}
+
+/* Modal Tokens */
+:root {
+  --modal-padding: var(--space-6);
+  --modal-radius: var(--radius-xl);
+  --modal-max-width-sm: 400px;
+  --modal-max-width-md: 500px;
+  --modal-max-width-lg: 640px;
+  --modal-max-width-xl: 800px;
+}
+
+/* Badge/Tag Tokens */
+:root {
+  --badge-padding-x: var(--space-2);
+  --badge-padding-y: var(--space-1);
+  --badge-font-size: var(--text-xs);
+  --badge-radius: var(--radius-sm);
+  --badge-font-weight: var(--font-medium);
+}
+
+/* ========================================
+   ANIMATION KEYFRAMES
+   ======================================== */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fadeInDown {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes scaleIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+@keyframes bounce {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-4px);
+  }
+}
+
+/* Animation utility classes */
+.animate-fade-in {
+  animation: fadeIn var(--duration-normal) var(--ease-out);
+}
+
+.animate-fade-in-up {
+  animation: fadeInUp var(--duration-normal) var(--ease-smooth);
+}
+
+.animate-fade-in-down {
+  animation: fadeInDown var(--duration-normal) var(--ease-smooth);
+}
+
+.animate-scale-in {
+  animation: scaleIn var(--duration-normal) var(--ease-smooth);
+}
+
+.animate-spin {
+  animation: spin 1s linear infinite;
+}
+
+.animate-pulse {
+  animation: pulse 2s var(--ease-in-out) infinite;
+}
+
+.animate-shimmer {
+  animation: shimmer 2s linear infinite;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.08) 50%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+}
+
+.animate-bounce {
+  animation: bounce 1s var(--ease-in-out) infinite;
+}

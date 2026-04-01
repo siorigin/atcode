@@ -1,0 +1,3383 @@
+# Copyright 2025 Vitali Avagyan.
+# Copyright (c) 2026 SiOrigin Co. Ltd.
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# This file is derived from code-graph-rag (MIT License).
+# Modifications by SiOrigin Co. Ltd. are licensed under Apache-2.0.
+# See the LICENSE file in the root directory for details.
+
+import json
+import re
+import textwrap
+import threading
+import xml.etree.ElementTree as ET
+from collections import defaultdict, deque
+from pathlib import Path
+from typing import Any
+
+import toml
+from core.language_config import LanguageConfig
+from graph.service import MemgraphIngestor
+from loguru import logger
+
+# No longer need constants import - using Tree-sitter directly
+from parser.languages.cpp import (
+    build_cpp_qualified_name,
+    extract_cpp_exported_class_name,
+    extract_cpp_function_name,
+    is_cpp_exported,
+)
+from parser.languages.java import extract_java_method_info
+from parser.languages.lua import extract_lua_assigned_name
+from parser.languages.python import resolve_class_name
+from parser.languages.rust import build_rust_module_path, extract_rust_impl_target
+from parser.utils import (
+    JS_TYPESCRIPT_LANGUAGES,
+    ingest_exported_function,
+    ingest_method,
+)
+from tree_sitter import Node, Query, QueryCursor
+
+from .import_ import ImportProcessor
+from .module_context import extract_module_context_for_language
+
+
+class DefinitionProcessor:
+    """Thread-safe processor for function, class, and method definitions.
+
+    All write operations to shared data structures are protected by locks
+    to enable parallel definition processing.
+    """
+
+    def __init__(
+        self,
+        ingestor: MemgraphIngestor,
+        repo_path: Path,
+        project_name: str,
+        function_registry: Any,
+        simple_name_lookup: dict[str, set[str]],
+        import_processor: ImportProcessor,
+        module_qn_to_file_path: dict[str, Path],
+    ):
+        self.ingestor = ingestor
+        self.repo_path = repo_path
+        self.project_name = project_name
+        self.function_registry = function_registry
+        self.simple_name_lookup = simple_name_lookup
+        self.import_processor = import_processor
+        self.module_qn_to_file_path = module_qn_to_file_path
+        self.class_inheritance: dict[str, list[str]] = {}
+        # Track C++ function definitions (functions with bodies) to prioritize over declarations
+        self.cpp_definitions: set[str] = set()
+        # Current file's relative path (thread-safe, set during process_file, used by node creation methods)
+        # Using threading.local() to prevent race conditions in parallel file processing
+        self._current_file_path = threading.local()
+
+        # Locks for thread-safe writes to shared data structures
+        self._simple_name_lock = threading.Lock()
+        self._module_qn_lock = threading.Lock()
+        self._class_inheritance_lock = threading.Lock()
+        self._cpp_definitions_lock = threading.Lock()
+        # Add a lock for function_registry access to prevent concurrent modification issues
+        self._registry_lock = (
+            function_registry._registry_lock
+            if hasattr(function_registry, "_registry_lock")
+            else threading.Lock()
+        )
+
+        # Thread-local accumulators for batching writes to shared structures.
+        # Each call to process_file_with_ast initialises these for its thread;
+        # at the end of the call, all accumulated entries are flushed to the
+        # shared structures with a single lock acquisition each — drastically
+        # reducing contention across 64 concurrent worker threads.
+        self._tl_buffers = (
+            threading.local()
+        )  # .registry_buf / .simple_name_buf / .node_buf / .rel_buf
+
+    # ---------------------------------------------------------------------------
+    # Thread-local ingestor helpers — buffer nodes/rels per file, flush in bulk
+    # ---------------------------------------------------------------------------
+    def _emit_node(self, label: str, properties: dict) -> None:
+        """Buffer a node for the current file, or write directly if no buffer active.
+
+        When called from within process_file_with_ast, the node is stored in a
+        thread-local list and flushed once at the end via extend_node_buffer —
+        replacing O(N) per-item lock acquisitions with a single O(1) call.
+        """
+        node_buf = getattr(self._tl_buffers, "node_buf", None)
+        if node_buf is not None:
+            node_buf.append((label, properties))
+        else:
+            self.ingestor.ensure_node_batch(label, properties)
+
+    def _emit_rel(
+        self,
+        from_spec: tuple,
+        rel_type: str,
+        to_spec: tuple,
+        properties: dict | None = None,
+    ) -> None:
+        """Buffer a relationship for the current file, or write directly if no buffer active.
+
+        When called from within process_file_with_ast, the relationship is stored
+        in a thread-local list and flushed once at the end via extend_relationship_buffer.
+        """
+        rel_buf = getattr(self._tl_buffers, "rel_buf", None)
+        if rel_buf is not None:
+            rel_buf.append((from_spec, rel_type, to_spec, properties))
+        else:
+            self.ingestor.ensure_relationship_batch(
+                from_spec, rel_type, to_spec, properties
+            )
+
+    # Thread-safe write methods for shared data structures
+    def _add_simple_name(self, func_name: str, func_qn: str) -> None:
+        """Thread-safe addition to simple_name_lookup.
+
+        If a per-file thread-local buffer is active (set up by
+        process_file_with_ast), the entry is deferred there and will be
+        flushed in one batch at the end of the file.  Otherwise it falls
+        back to the direct single-entry write.
+        """
+        buf = getattr(self._tl_buffers, "simple_name_buf", None)
+        if buf is not None:
+            buf[func_name].add(func_qn)
+            return
+        with self._simple_name_lock:
+            self.simple_name_lookup[func_name].add(func_qn)
+
+    def _set_module_qn_path(self, module_qn: str, file_path: Path) -> None:
+        """Thread-safe assignment to module_qn_to_file_path."""
+        with self._module_qn_lock:
+            self.module_qn_to_file_path[module_qn] = file_path
+
+    def _set_class_inheritance(self, class_qn: str, parent_classes: list[str]) -> None:
+        """Thread-safe assignment to class_inheritance."""
+        with self._class_inheritance_lock:
+            self.class_inheritance[class_qn] = parent_classes
+
+    def _add_class_parent(self, child_qn: str, parent_qn: str) -> None:
+        """Thread-safe addition of parent to class_inheritance."""
+        with self._class_inheritance_lock:
+            if child_qn not in self.class_inheritance:
+                self.class_inheritance[child_qn] = []
+            if parent_qn not in self.class_inheritance[child_qn]:
+                self.class_inheritance[child_qn].append(parent_qn)
+
+    def _add_cpp_definition(self, func_qn: str) -> None:
+        """Thread-safe addition to cpp_definitions."""
+        with self._cpp_definitions_lock:
+            self.cpp_definitions.add(func_qn)
+
+    def _queue_registry_entry(self, qualified_name: str, func_type: str) -> None:
+        """Write a (qualified_name, type) entry to the function registry.
+
+        When called from within process_file_with_ast, the entry is stored in
+        a thread-local buffer and flushed in one bulk_insert at the end of the
+        file — replacing N individual lock acquisitions with a single one.
+        When called outside that context (e.g., from tests or the single-threaded
+        path) it falls back to a direct write.
+        """
+        buf = getattr(self._tl_buffers, "registry_buf", None)
+        if buf is not None:
+            buf[qualified_name] = func_type
+            return
+        # Direct write — handles both FunctionRegistryTrie and plain dict
+        self.function_registry[qualified_name] = func_type
+
+    def _get_node_type_for_inheritance(self, qualified_name: str) -> str:
+        """
+        Determine the node type for inheritance relationships.
+        Returns the type from the function registry, defaulting to "Class".
+        """
+        node_type = self.function_registry.get(qualified_name, "Class")
+        return str(node_type)
+
+    def _create_inheritance_relationship(
+        self, child_node_type: str, child_qn: str, parent_qn: str
+    ) -> None:
+        """
+        Create an INHERITS relationship between child and parent entities.
+        Determines the parent type automatically from the function registry.
+        """
+        parent_type = self._get_node_type_for_inheritance(parent_qn)
+        self._emit_rel(
+            (child_node_type, "qualified_name", child_qn),
+            "INHERITS",
+            (parent_type, "qualified_name", parent_qn),
+        )
+
+    def process_file(
+        self,
+        file_path: Path,
+        language: str,
+        queries: dict[str, Any],
+        structural_elements: dict[Path, str | None],
+    ) -> tuple[Node, str] | None:
+        """
+        Parses a file, ingests its structure and definitions,
+        and returns the AST for caching.
+        """
+        if isinstance(file_path, str):
+            file_path = Path(file_path)
+        try:
+            relative_path = file_path.relative_to(self.repo_path)
+        except ValueError:
+            logger.warning(f"File not relative to repo_path, skipping: {file_path}")
+            return None
+
+        # Normalize relative_path: remove duplicate project_name prefix
+        # E.g., if project_name is "simo" and relative_path is "simo/simo/csrc/xxx.py",
+        # we want "simo/csrc/xxx.py" not "simo/simo/csrc/xxx.py"
+        rel_parts = list(relative_path.parts)
+        if (
+            len(rel_parts) >= 2
+            and rel_parts[0] == self.project_name
+            and rel_parts[1] == self.project_name
+        ):
+            # Remove the duplicate project_name at the beginning
+            relative_path = Path(*rel_parts[1:])
+            logger.debug(
+                f"Normalized path with duplicate prefix: {rel_parts} -> {list(relative_path.parts)}"
+            )
+
+        relative_path_str = str(relative_path)
+        # Store current file's relative path for use in node creation methods (thread-safe)
+        self._current_file_path.value = relative_path_str
+        logger.debug(f"Parsing and Caching AST for {language}: {relative_path_str}")
+
+        try:
+            # Check if language is supported
+            if language not in queries:
+                logger.warning(f"Unsupported language '{language}' for {file_path}")
+                return None
+
+            source_bytes = file_path.read_bytes()
+            # We need access to parsers, but we'll get it through queries
+            lang_queries = queries[language]
+            parser = lang_queries.get("parser")
+            if not parser:
+                logger.warning(f"No parser available for {language}")
+                return None
+
+            tree = parser.parse(source_bytes)
+            root_node = tree.root_node
+
+            # Build module qualified name, avoiding duplicate project_name prefix
+            # E.g., if project_name is "simo" and relative_path is "simo/algorithm/file.py",
+            # we want "simo.algorithm" not "simo.simo.algorithm"
+            parts = list(relative_path.with_suffix("").parts)
+            if parts and parts[0] == self.project_name:
+                parts = parts[1:]  # Skip duplicate project name
+            module_qn = ".".join([self.project_name] + parts)
+
+            if file_path.name == "__init__.py":
+                parent_parts = list(relative_path.parent.parts)
+                if parent_parts and parent_parts[0] == self.project_name:
+                    parent_parts = parent_parts[1:]
+                module_qn = ".".join([self.project_name] + parent_parts)
+            elif file_path.name == "mod.rs":
+                # In Rust, mod.rs represents the parent module directory
+                parent_parts = list(relative_path.parent.parts)
+                if parent_parts and parent_parts[0] == self.project_name:
+                    parent_parts = parent_parts[1:]
+                module_qn = ".".join([self.project_name] + parent_parts)
+
+            # Populate the module QN to file path mapping for efficient lookups
+            self._set_module_qn_path(module_qn, file_path)
+
+            # Extract module context (imports, constants, etc.)
+            module_context = extract_module_context_for_language(root_node, language)
+
+            # Update File node with code-specific properties (qualified_name, module_context)
+            # The File node is created by structure_processor, we add code semantics here
+            self._emit_node(
+                "File",
+                {
+                    "path": relative_path_str,
+                    "name": file_path.name,
+                    "extension": file_path.suffix,
+                    "qualified_name": module_qn,
+                    "module_context": module_context,
+                },
+            )
+            # Note: CONTAINS_FILE relationship is created by structure_processor
+            # No need for CONTAINS_MODULE as File already has the containment relationship
+
+            self.import_processor.parse_imports(root_node, module_qn, language, queries)
+            self._ingest_missing_import_patterns(
+                root_node, module_qn, language, queries
+            )
+            self._ingest_all_functions(root_node, module_qn, language, queries)
+
+            # Handle C++20 module-specific processing and Pybind11 bindings
+            # Must come AFTER _ingest_all_functions so that C++ function targets are in the registry
+            if language == "cpp":
+                self._ingest_cpp_module_declarations(
+                    root_node, module_qn, file_path, queries
+                )
+                self._ingest_pybind11_bindings(root_node, module_qn, language, queries)
+            self._ingest_classes_and_methods(root_node, module_qn, language, queries)
+            self._ingest_object_literal_methods(root_node, module_qn, language, queries)
+            self._ingest_commonjs_exports(root_node, module_qn, language, queries)
+            self._ingest_es6_exports(root_node, module_qn, language, queries)
+            self._ingest_assignment_arrow_functions(
+                root_node, module_qn, language, queries
+            )
+            self._ingest_prototype_inheritance(root_node, module_qn, language, queries)
+
+            return root_node, language
+
+        except Exception as e:
+            logger.error(f"Failed to parse or ingest {file_path}: {e}")
+            return None
+
+    def process_file_with_content(
+        self,
+        file_path: Path,
+        source_bytes: bytes,
+        language: str,
+        queries: dict[str, Any],
+        structural_elements: dict[Path, str | None],
+    ) -> tuple[Node, str] | None:
+        """
+        Parses a file with pre-read content, ingests its structure and definitions,
+        and returns the AST for caching.
+
+        This method is optimized for parallel processing where file content
+        has been pre-read in parallel to reduce I/O wait time.
+
+        Args:
+            file_path: Path to the file
+            source_bytes: Pre-read file content as bytes
+            language: Language identifier for parsing
+            queries: Language query configurations
+            structural_elements: Map of paths to structural element qualified names
+
+        Returns:
+            Tuple of (root_node, language) or None if parsing fails
+        """
+        if isinstance(file_path, str):
+            file_path = Path(file_path)
+        try:
+            relative_path = file_path.relative_to(self.repo_path)
+        except ValueError:
+            logger.warning(f"File not relative to repo_path, skipping: {file_path}")
+            return None
+        relative_path_str = str(relative_path)
+        # Store current file's relative path for use in node creation methods (thread-safe)
+        self._current_file_path.value = relative_path_str
+        logger.debug(f"Parsing and Caching AST for {language}: {relative_path_str}")
+
+        try:
+            # Check if language is supported
+            if language not in queries:
+                logger.warning(f"Unsupported language '{language}' for {file_path}")
+                return None
+
+            # We need access to parsers, but we'll get it through queries
+            lang_queries = queries[language]
+            parser = lang_queries.get("parser")
+            if not parser:
+                logger.warning(f"No parser available for {language}")
+                return None
+
+            tree = parser.parse(source_bytes)
+            root_node = tree.root_node
+
+            # Build module qualified name, avoiding duplicate project_name prefix
+            # E.g., if project_name is "simo" and relative_path is "simo/algorithm/file.py",
+            # we want "simo.algorithm" not "simo.simo.algorithm"
+            parts = list(relative_path.with_suffix("").parts)
+            if parts and parts[0] == self.project_name:
+                parts = parts[1:]  # Skip duplicate project name
+            module_qn = ".".join([self.project_name] + parts)
+
+            if file_path.name == "__init__.py":
+                parent_parts = list(relative_path.parent.parts)
+                if parent_parts and parent_parts[0] == self.project_name:
+                    parent_parts = parent_parts[1:]
+                module_qn = ".".join([self.project_name] + parent_parts)
+            elif file_path.name == "mod.rs":
+                # In Rust, mod.rs represents the parent module directory
+                parent_parts = list(relative_path.parent.parts)
+                if parent_parts and parent_parts[0] == self.project_name:
+                    parent_parts = parent_parts[1:]
+                module_qn = ".".join([self.project_name] + parent_parts)
+
+            # Populate the module QN to file path mapping for efficient lookups
+            self._set_module_qn_path(module_qn, file_path)
+
+            # Extract module context (imports, constants, etc.)
+            module_context = extract_module_context_for_language(root_node, language)
+
+            # Update File node with code-specific properties (qualified_name, module_context)
+            # The File node is created by structure_processor, we add code semantics here
+            self._emit_node(
+                "File",
+                {
+                    "path": relative_path_str,
+                    "name": file_path.name,
+                    "extension": file_path.suffix,
+                    "qualified_name": module_qn,
+                    "module_context": module_context,
+                },
+            )
+            # Note: CONTAINS_FILE relationship is created by structure_processor
+            # No need for CONTAINS_MODULE as File already has the containment relationship
+
+            self.import_processor.parse_imports(root_node, module_qn, language, queries)
+            self._ingest_missing_import_patterns(
+                root_node, module_qn, language, queries
+            )
+            self._ingest_all_functions(root_node, module_qn, language, queries)
+
+            # Handle C++20 module-specific processing and Pybind11 bindings
+            # Must come AFTER _ingest_all_functions so that C++ function targets are in the registry
+            if language == "cpp":
+                self._ingest_cpp_module_declarations(
+                    root_node, module_qn, file_path, queries
+                )
+                self._ingest_pybind11_bindings(root_node, module_qn, language, queries)
+            self._ingest_classes_and_methods(root_node, module_qn, language, queries)
+            self._ingest_object_literal_methods(root_node, module_qn, language, queries)
+            self._ingest_commonjs_exports(root_node, module_qn, language, queries)
+            self._ingest_es6_exports(root_node, module_qn, language, queries)
+            self._ingest_assignment_arrow_functions(
+                root_node, module_qn, language, queries
+            )
+            self._ingest_prototype_inheritance(root_node, module_qn, language, queries)
+
+            return root_node, language
+
+        except Exception as e:
+            logger.error(f"Failed to parse or ingest {file_path}: {e}")
+            return None
+
+    def process_file_with_ast(
+        self,
+        file_path: Path,
+        root_node: Node,
+        language: str,
+        queries: dict[str, Any],
+        structural_elements: dict[Path, str | None],
+    ) -> tuple[Node, str] | None:
+        """
+        Process a file with a pre-parsed AST.
+
+        This method is optimized for parallel processing where AST parsing
+        has been done in parallel using a ParserPool. It only handles the
+        definition ingestion without needing to parse the file.
+
+        Args:
+            file_path: Path to the file
+            root_node: Pre-parsed AST root node
+            language: Language identifier
+            queries: Language query configurations
+            structural_elements: Map of paths to structural element qualified names
+
+        Returns:
+            Tuple of (root_node, language) or None if processing fails
+        """
+        if isinstance(file_path, str):
+            file_path = Path(file_path)
+        try:
+            relative_path = file_path.relative_to(self.repo_path)
+        except ValueError:
+            logger.warning(f"File not relative to repo_path, skipping: {file_path}")
+            return None
+        relative_path_str = str(relative_path)
+        # Store current file's relative path for use in node creation methods (thread-safe)
+        self._current_file_path.value = relative_path_str
+
+        # Initialise per-file thread-local accumulators.  All writes to
+        # function_registry, simple_name_lookup, node_buffer, and rel_buffer
+        # that happen during this call will be buffered here and flushed with
+        # a single lock acquisition each at the end — reducing contention
+        # across 64 concurrent worker threads from O(N) to O(1).
+        self._tl_buffers.registry_buf = {}
+        self._tl_buffers.simple_name_buf = defaultdict(set)
+        self._tl_buffers.node_buf = []
+        self._tl_buffers.rel_buf = []
+
+        try:
+            # Check if language is supported
+            if language not in queries:
+                logger.warning(f"Unsupported language '{language}' for {file_path}")
+                return None
+
+            # Build module qualified name, avoiding duplicate project_name prefix
+            # E.g., if project_name is "simo" and relative_path is "simo/algorithm/file.py",
+            # we want "simo.algorithm" not "simo.simo.algorithm"
+            parts = list(relative_path.with_suffix("").parts)
+            if parts and parts[0] == self.project_name:
+                parts = parts[1:]  # Skip duplicate project_name
+            module_qn = ".".join([self.project_name] + parts)
+
+            if file_path.name == "__init__.py":
+                parent_parts = list(relative_path.parent.parts)
+                if parent_parts and parent_parts[0] == self.project_name:
+                    parent_parts = parent_parts[1:]
+                module_qn = ".".join([self.project_name] + parent_parts)
+            elif file_path.name == "mod.rs":
+                # In Rust, mod.rs represents the parent module directory
+                parent_parts = list(relative_path.parent.parts)
+                if parent_parts and parent_parts[0] == self.project_name:
+                    parent_parts = parent_parts[1:]
+                module_qn = ".".join([self.project_name] + parent_parts)
+
+            logger.debug(f"  [PHASE] START processing file: {relative_path_str}")
+
+            # Populate the module QN to file path mapping for efficient lookups
+            self._set_module_qn_path(module_qn, file_path)
+
+            # Extract module context (imports, constants, etc.)
+            module_context = extract_module_context_for_language(root_node, language)
+
+            # Update File node with code-specific properties (qualified_name, module_context)
+            # The File node is created by structure_processor, we add code semantics here
+            self._emit_node(
+                "File",
+                {
+                    "path": relative_path_str,
+                    "name": file_path.name,
+                    "extension": file_path.suffix,
+                    "qualified_name": module_qn,
+                    "module_context": module_context,
+                },
+            )
+            # Note: CONTAINS_FILE relationship is created by structure_processor
+            # No need for CONTAINS_MODULE as File already has the containment relationship
+
+            logger.debug(f"  [PHASE] imports: {module_qn}")
+            self.import_processor.parse_imports(root_node, module_qn, language, queries)
+            self._ingest_missing_import_patterns(
+                root_node, module_qn, language, queries
+            )
+
+            logger.debug(f"  [PHASE] functions: {module_qn}")
+            self._ingest_all_functions(root_node, module_qn, language, queries)
+
+            # Handle C++20 module-specific processing and Pybind11 bindings
+            # Must come AFTER _ingest_all_functions so that C++ function targets are in the registry
+            if language == "cpp":
+                self._ingest_cpp_module_declarations(
+                    root_node, module_qn, file_path, queries
+                )
+                self._ingest_pybind11_bindings(root_node, module_qn, language, queries)
+
+            logger.debug(f"  [PHASE] classes: {module_qn}")
+            self._ingest_classes_and_methods(root_node, module_qn, language, queries)
+
+            logger.debug(f"  [PHASE] object_literals: {module_qn}")
+            self._ingest_object_literal_methods(root_node, module_qn, language, queries)
+
+            logger.debug(f"  [PHASE] commonjs: {module_qn}")
+            self._ingest_commonjs_exports(root_node, module_qn, language, queries)
+
+            logger.debug(f"  [PHASE] es6_exports: {module_qn}")
+            self._ingest_es6_exports(root_node, module_qn, language, queries)
+
+            logger.debug(f"  [PHASE] arrow_functions: {module_qn}")
+            self._ingest_assignment_arrow_functions(
+                root_node, module_qn, language, queries
+            )
+
+            logger.debug(f"  [PHASE] prototype_inheritance: {module_qn}")
+            self._ingest_prototype_inheritance(root_node, module_qn, language, queries)
+
+            logger.debug(f"  [PHASE] COMPLETED: {module_qn}")
+
+            return root_node, language
+
+        except Exception as e:
+            logger.error(f"Failed to process {file_path}: {e}")
+            return None
+
+        finally:
+            # Flush the per-file thread-local buffers into the shared structures
+            # using a single lock acquisition each — O(1) locks instead of O(N).
+            reg_buf = getattr(self._tl_buffers, "registry_buf", None)
+            sn_buf = getattr(self._tl_buffers, "simple_name_buf", None)
+            node_buf = getattr(self._tl_buffers, "node_buf", None)
+            rel_buf = getattr(self._tl_buffers, "rel_buf", None)
+
+            if reg_buf:
+                bulk = getattr(self.function_registry, "bulk_insert", None)
+                if bulk is not None:
+                    bulk(reg_buf)
+                else:
+                    # Fallback for plain-dict registries (tests / multiprocess worker)
+                    for _qn, _ft in reg_buf.items():
+                        self.function_registry[_qn] = _ft
+
+            if sn_buf:
+                with self._simple_name_lock:
+                    for _name, _qns in sn_buf.items():
+                        self.simple_name_lookup[_name].update(_qns)
+
+            # Flush buffered nodes via a single bulk-extend (1 lock vs N locks)
+            if node_buf:
+                extend_nodes = getattr(self.ingestor, "extend_node_buffer", None)
+                if extend_nodes is not None:
+                    extend_nodes(node_buf)
+                else:
+                    for _label, _props in node_buf:
+                        self.ingestor.ensure_node_batch(_label, _props)
+
+            # Flush buffered relationships via a single bulk-extend (1 lock vs N locks)
+            if rel_buf:
+                extend_rels = getattr(self.ingestor, "extend_relationship_buffer", None)
+                if extend_rels is not None:
+                    extend_rels(rel_buf)
+                else:
+                    for _from, _rtype, _to, _props in rel_buf:
+                        self.ingestor.ensure_relationship_batch(
+                            _from, _rtype, _to, _props
+                        )
+
+            # Clear buffers so stale data is never reused by this thread
+            self._tl_buffers.registry_buf = None
+            self._tl_buffers.simple_name_buf = None
+            self._tl_buffers.node_buf = None
+            self._tl_buffers.rel_buf = None
+
+    def process_dependencies(self, filepath: Path) -> None:
+        """Parse various dependency files for external package dependencies."""
+        file_name = filepath.name.lower()
+        logger.info(f"  Parsing dependency file: {filepath}")
+
+        try:
+            if file_name == "pyproject.toml":
+                self._parse_pyproject_toml(filepath)
+            elif file_name == "requirements.txt":
+                self._parse_requirements_txt(filepath)
+            elif file_name == "package.json":
+                self._parse_package_json(filepath)
+            elif file_name == "cargo.toml":
+                self._parse_cargo_toml(filepath)
+            elif file_name == "go.mod":
+                self._parse_go_mod(filepath)
+            elif file_name == "gemfile":
+                self._parse_gemfile(filepath)
+            elif file_name == "composer.json":
+                self._parse_composer_json(filepath)
+            elif filepath.suffix.lower() == ".csproj":
+                self._parse_csproj(filepath)
+            else:
+                logger.debug(f"    Unknown dependency file format: {filepath}")
+        except Exception as e:
+            logger.error(f"    Error parsing {filepath}: {e}")
+
+    def _extract_pep508_package_name(self, dep_string: str) -> tuple[str, str]:
+        """Extracts the package name and the rest of the spec from a PEP 508 string."""
+        # Match package name (with optional extras) - more robust than chain of splits
+        match = re.match(r"^([a-zA-Z0-9_.-]+(?:\[[^\]]*\])?)", dep_string.strip())
+        if not match:
+            return "", ""
+        name_with_extras = match.group(1)
+        # Extract just the package name without extras
+        name_match = re.match(r"^([a-zA-Z0-9_.-]+)", name_with_extras)
+        if not name_match:
+            return "", ""
+        name = name_match.group(1)
+        spec = dep_string[len(name_with_extras) :].strip()
+        return name, spec
+
+    def _parse_pyproject_toml(self, filepath: Path) -> None:
+        """Parse pyproject.toml for Python dependencies."""
+        data = toml.load(filepath)
+
+        # Handle Poetry dependencies
+        poetry_deps = data.get("tool", {}).get("poetry", {}).get("dependencies", {})
+        if poetry_deps:
+            for dep_name, dep_spec in poetry_deps.items():
+                if dep_name.lower() == "python":
+                    continue
+                self._add_dependency(dep_name, str(dep_spec))
+
+        # Handle PEP 621 project dependencies
+        project_deps = data.get("project", {}).get("dependencies", [])
+        if project_deps:
+            for dep_line in project_deps:
+                dep_name, _ = self._extract_pep508_package_name(dep_line)
+                if dep_name:
+                    self._add_dependency(dep_name, dep_line)
+
+        # Handle optional dependencies
+        optional_deps = data.get("project", {}).get("optional-dependencies", {})
+        for group_name, deps in optional_deps.items():
+            for dep_line in deps:
+                dep_name, _ = self._extract_pep508_package_name(dep_line)
+                if dep_name:
+                    self._add_dependency(
+                        dep_name, dep_line, properties={"group": group_name}
+                    )
+
+    def _parse_requirements_txt(self, filepath: Path) -> None:
+        """Parse requirements.txt for Python dependencies."""
+        with open(filepath, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or line.startswith("-"):
+                    continue
+
+                # Extract package name and version spec from requirement specification
+                dep_name, version_spec = self._extract_pep508_package_name(line)
+                if dep_name:
+                    self._add_dependency(dep_name, version_spec)
+
+    def _parse_package_json(self, filepath: Path) -> None:
+        """Parse package.json for Node.js dependencies."""
+
+        with open(filepath, encoding="utf-8") as f:
+            data = json.load(f)
+
+        # Regular dependencies
+        deps = data.get("dependencies", {})
+        for dep_name, dep_spec in deps.items():
+            self._add_dependency(dep_name, dep_spec)
+
+        # Development dependencies
+        dev_deps = data.get("devDependencies", {})
+        for dep_name, dep_spec in dev_deps.items():
+            self._add_dependency(dep_name, dep_spec)
+
+        # Peer dependencies
+        peer_deps = data.get("peerDependencies", {})
+        for dep_name, dep_spec in peer_deps.items():
+            self._add_dependency(dep_name, dep_spec)
+
+    def _parse_cargo_toml(self, filepath: Path) -> None:
+        """Parse Cargo.toml for Rust dependencies."""
+        data = toml.load(filepath)
+
+        # Regular dependencies
+        deps = data.get("dependencies", {})
+        for dep_name, dep_spec in deps.items():
+            version = (
+                dep_spec if isinstance(dep_spec, str) else dep_spec.get("version", "")
+            )
+            self._add_dependency(dep_name, version)
+
+        # Development dependencies
+        dev_deps = data.get("dev-dependencies", {})
+        for dep_name, dep_spec in dev_deps.items():
+            version = (
+                dep_spec if isinstance(dep_spec, str) else dep_spec.get("version", "")
+            )
+            self._add_dependency(dep_name, version)
+
+    def _parse_go_mod(self, filepath: Path) -> None:
+        """Parse go.mod for Go dependencies."""
+        with open(filepath, encoding="utf-8") as f:
+            in_require_block = False
+            for line in f:
+                line = line.strip()
+
+                if line.startswith("require ("):
+                    in_require_block = True
+                    continue
+                elif line == ")" and in_require_block:
+                    in_require_block = False
+                    continue
+                elif line.startswith("require ") and not in_require_block:
+                    # Single require statement
+                    parts = line.split()[1:]
+                    if len(parts) >= 2:
+                        dep_name = parts[0]
+                        version = parts[1]
+                        self._add_dependency(dep_name, version)
+                elif in_require_block and line and not line.startswith("//"):
+                    # Inside require block
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        dep_name = parts[0]
+                        version = parts[1]
+                        if not version.startswith("//"):  # Skip comments
+                            self._add_dependency(dep_name, version)
+
+    def _parse_gemfile(self, filepath: Path) -> None:
+        """Parse Gemfile for Ruby dependencies."""
+        with open(filepath, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("gem "):
+                    # Parse gem "name", "version" or gem "name", ">= version"
+
+                    match = re.match(
+                        r'gem\s+["\']([^"\']+)["\'](?:\s*,\s*["\']([^"\']+)["\'])?',
+                        line,
+                    )
+                    if match:
+                        dep_name = match.group(1)
+                        version = match.group(2) if match.group(2) else ""
+                        self._add_dependency(dep_name, version)
+
+    def _parse_composer_json(self, filepath: Path) -> None:
+        """Parse composer.json for PHP dependencies."""
+
+        with open(filepath, encoding="utf-8") as f:
+            data = json.load(f)
+
+        # Regular dependencies
+        deps = data.get("require", {})
+        for dep_name, dep_spec in deps.items():
+            if dep_name != "php":  # Skip PHP version requirement
+                self._add_dependency(dep_name, dep_spec)
+
+        # Development dependencies
+        dev_deps = data.get("require-dev", {})
+        for dep_name, dep_spec in dev_deps.items():
+            self._add_dependency(dep_name, dep_spec)
+
+    def _parse_csproj(self, filepath: Path) -> None:
+        """Parse .csproj files for .NET dependencies."""
+
+        try:
+            tree = ET.parse(filepath)
+            root = tree.getroot()
+
+            # Find all PackageReference elements
+            for pkg_ref in root.iter("PackageReference"):
+                include = pkg_ref.get("Include")
+                version = pkg_ref.get("Version")
+
+                if include:
+                    self._add_dependency(include, version or "")
+
+        except ET.ParseError as e:
+            logger.error(f"    Error parsing XML in {filepath}: {e}")
+
+    def _add_dependency(
+        self, dep_name: str, dep_spec: str, properties: dict[str, str] | None = None
+    ) -> None:
+        """Add a dependency to the graph."""
+        if not dep_name or dep_name.lower() in ["python", "php"]:
+            return
+
+        logger.debug(f"    Found dependency: {dep_name} (spec: {dep_spec})")
+        self._emit_node("ExternalPackage", {"name": dep_name})
+
+        # Build relationship properties
+        rel_properties = {"version_spec": dep_spec} if dep_spec else {}
+        if properties:
+            rel_properties.update(properties)
+
+        self._emit_rel(
+            ("Project", "name", self.project_name),
+            "DEPENDS_ON_EXTERNAL",
+            ("ExternalPackage", "name", dep_name),
+            properties=rel_properties,
+        )
+
+    def _get_docstring(self, node: Node) -> str | None:
+        """Extracts the docstring from a function or class node's body."""
+        body_node = node.child_by_field_name("body")
+        if not body_node or not body_node.children:
+            return None
+        first_statement = body_node.children[0]
+        if (
+            first_statement.type == "expression_statement"
+            and first_statement.children[0].type == "string"
+        ):
+            text = first_statement.children[0].text
+            if text is not None:
+                result: str = text.decode("utf-8").strip("'\" \n")
+                return result
+        return None
+
+    def _extract_decorators(self, node: Node) -> list[str]:
+        """Extract decorator names from a decorated node."""
+        decorators = []
+
+        # Check if this node has a parent that is a decorated_definition
+        current = node.parent
+        while current:
+            if current.type == "decorated_definition":
+                # Get all decorator nodes
+                for child in current.children:
+                    if child.type == "decorator":
+                        decorator_name = self._get_decorator_name(child)
+                        if decorator_name:
+                            decorators.append(decorator_name)
+                break
+            current = current.parent
+
+        return decorators
+
+    def _get_decorator_name(self, decorator_node: Node) -> str | None:
+        """Extract the name from a decorator node (@decorator or @decorator(...))."""
+        # Handle @decorator or @module.decorator
+        for child in decorator_node.children:
+            if child.type == "identifier":
+                text = child.text
+                if text is not None:
+                    decorator_name: str = text.decode("utf8")
+                    return decorator_name
+            elif child.type == "attribute":
+                # Handle @module.decorator
+                text = child.text
+                if text is not None:
+                    attr_name: str = text.decode("utf8")
+                    return attr_name
+            elif child.type == "call":
+                # Handle @decorator(...) - get the function being called
+                func_node = child.child_by_field_name("function")
+                if func_node:
+                    if func_node.type == "identifier":
+                        text = func_node.text
+                        if text is not None:
+                            func_name: str = text.decode("utf8")
+                            return func_name
+                    elif func_node.type == "attribute":
+                        text = func_node.text
+                        if text is not None:
+                            func_attr_name: str = text.decode("utf8")
+                            return func_attr_name
+        return None
+
+    def _extract_template_class_type(self, template_node: Node) -> str | None:
+        """Extract the underlying class type from a template declaration."""
+        # Look for the class/struct/union specifier within the template
+        for child in template_node.children:
+            if child.type == "class_specifier":
+                return "Class"
+            elif child.type == "struct_specifier":
+                return "Class"  # In C++, structs are essentially classes
+            elif child.type == "union_specifier":
+                return "Union"
+            elif child.type == "enum_specifier":
+                return "Enum"
+        return None
+
+    def _extract_cpp_class_name(self, class_node: Node) -> str | None:
+        """Extract class name from C++ class/struct/union/enum specifiers."""
+        # For template declarations, look inside for the actual class
+        if class_node.type == "template_declaration":
+            for child in class_node.children:
+                if child.type in [
+                    "class_specifier",
+                    "struct_specifier",
+                    "union_specifier",
+                    "enum_specifier",
+                ]:
+                    return self._extract_cpp_class_name(child)
+
+        # Look for type_identifier (C++ uses this instead of identifier for class names)
+        for child in class_node.children:
+            if child.type == "type_identifier" and child.text:
+                return str(child.text.decode("utf8"))
+
+        # Fallback to regular name field
+        name_node = class_node.child_by_field_name("name")
+        if name_node and name_node.text:
+            return str(name_node.text.decode("utf8"))
+
+        return None
+
+    def _extract_class_name(self, class_node: Node) -> str | None:
+        """Extract class name, handling both class declarations and class expressions."""
+        # For regular class declarations, try the name field first
+        name_node = class_node.child_by_field_name("name")
+        if name_node and name_node.text:
+            return str(name_node.text.decode("utf8"))
+
+        # For class expressions, look in parent variable_declarator
+        # Pattern: const Animal = class { ... }
+        current = class_node.parent
+        while current:
+            if current.type == "variable_declarator":
+                # Find the identifier child (the name)
+                for child in current.children:
+                    if child.type == "identifier" and child.text:
+                        return str(child.text.decode("utf8"))
+            current = current.parent
+
+        return None
+
+    def _extract_function_name(self, func_node: Node) -> str | None:
+        """Extract function name, handling both regular functions and arrow functions."""
+        # For regular functions, try the name field first
+        name_node = func_node.child_by_field_name("name")
+        if name_node and name_node.text:
+            return str(name_node.text.decode("utf8"))
+
+        # For arrow functions, look in parent variable_declarator
+        if func_node.type == "arrow_function":
+            current = func_node.parent
+            while current:
+                if current.type == "variable_declarator":
+                    # Find the identifier child (the name)
+                    for child in current.children:
+                        if child.type == "identifier" and child.text:
+                            return str(child.text.decode("utf8"))
+                current = current.parent
+
+        return None
+
+    def _generate_anonymous_function_name(self, func_node: Node, module_qn: str) -> str:
+        """Generate a synthetic name for anonymous functions (IIFEs, callbacks, etc.)."""
+        # Check if this is an IIFE pattern: function -> parenthesized_expression -> call_expression
+        parent = func_node.parent
+        if parent and parent.type == "parenthesized_expression":
+            grandparent = parent.parent
+            if grandparent and grandparent.type == "call_expression":
+                # Check if the parenthesized expression is the function being called
+                if grandparent.child_by_field_name("function") == parent:
+                    func_type = (
+                        "arrow" if func_node.type == "arrow_function" else "func"
+                    )
+                    return f"iife_{func_type}_{func_node.start_point[0]}_{func_node.start_point[1]}"
+
+        # Check direct call pattern (less common but possible)
+        if parent and parent.type == "call_expression":
+            if parent.child_by_field_name("function") == func_node:
+                return (
+                    f"iife_direct_{func_node.start_point[0]}_{func_node.start_point[1]}"
+                )
+
+        # For other anonymous functions (callbacks, etc.), use location-based name
+        return f"anonymous_{func_node.start_point[0]}_{func_node.start_point[1]}"
+
+    def _extract_lua_assignment_function_name(self, func_node: Node) -> str | None:
+        """Extract function name from Lua assignment patterns like Calculator.divide = function()."""
+        # Use shared utility to extract the assigned name
+        # Accept both identifier and dot_index_expression for Lua assignments
+        return extract_lua_assigned_name(
+            func_node, accepted_var_types=("dot_index_expression", "identifier")
+        )
+
+    def _ingest_all_functions(
+        self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
+    ) -> None:
+        """Extract and ingest all functions (including nested ones)."""
+        lang_queries = queries[language]
+        lang_config: LanguageConfig = lang_queries["config"]
+
+        query = lang_queries["functions"]
+        cursor = QueryCursor(query)
+        captures = cursor.captures(root_node)
+
+        func_nodes = captures.get("function", [])
+
+        # Process regular functions
+        for func_node in func_nodes:
+            if not isinstance(func_node, Node):
+                logger.warning(
+                    f"Expected Node object but got {type(func_node)}: {func_node}"
+                )
+                continue
+            if self._is_method(func_node, lang_config):
+                continue
+
+            # Extract function name - use C++ specific logic for C++
+            if language == "cpp":
+                func_name = extract_cpp_function_name(func_node)
+                if not func_name:
+                    if func_node.type == "lambda_expression":
+                        # Generate a synthetic name for anonymous lambda functions
+                        func_name = f"lambda_{func_node.start_point[0]}_{func_node.start_point[1]}"
+                    else:
+                        continue  # Skip other unnamed C++ function-like nodes
+                # Build C++ qualified name with namespace support
+                func_qn = build_cpp_qualified_name(func_node, module_qn, func_name)
+                # Check if this is an exported function
+                is_exported = is_cpp_exported(func_node)
+
+                # Check if this is a definition (has body)
+                # In Tree-sitter C++, function_definition has a body field (compound_statement)
+                # If it's a declaration (just signature), it might be parsed as declaration or function_definition without body
+                has_body = func_node.child_by_field_name("body") is not None
+                if has_body:
+                    self._add_cpp_definition(func_qn)
+            else:
+                is_exported = False  # Default for non-C++ languages
+                has_body = True  # Assume true for other languages processed here
+                # Extract function name - handle arrow functions specially
+                func_name = self._extract_function_name(func_node)
+
+                # Special handling for Lua function_definition nodes in assignments
+                if (
+                    not func_name
+                    and language == "lua"
+                    and func_node.type == "function_definition"
+                ):
+                    func_name = self._extract_lua_assignment_function_name(func_node)
+
+                if not func_name:
+                    # Generate synthetic name for anonymous functions (IIFEs, callbacks, etc.)
+                    func_name = self._generate_anonymous_function_name(
+                        func_node, module_qn
+                    )
+
+                # Build proper qualified name - special handling for Rust inline modules
+                if language == "rust":
+                    func_qn = self._build_rust_function_qualified_name(
+                        func_node, module_qn, func_name
+                    )
+                else:
+                    func_qn = (
+                        self._build_nested_qualified_name(
+                            func_node, module_qn, func_name, lang_config
+                        )
+                        or f"{module_qn}.{func_name}"
+                    )  # Fallback to simple name
+
+            # Extract function properties
+            decorators = self._extract_decorators(func_node)
+            func_props: dict[str, Any] = {
+                "qualified_name": func_qn,
+                "name": func_name,
+                "decorators": decorators,
+                "start_line": func_node.start_point[0] + 1,
+                "end_line": func_node.end_point[0] + 1,
+                "docstring": self._get_docstring(func_node),
+                "is_exported": is_exported,
+                "is_definition": has_body,
+                "path": getattr(self._current_file_path, "value", None),
+            }
+            logger.debug(f"  Found Function: {func_name} (qn: {func_qn})")
+            self._emit_node("Function", func_props)
+
+            self._queue_registry_entry(func_qn, "Function")
+            self._add_simple_name(func_name, func_qn)
+
+            # Determine parent and create proper relationship
+            parent_type, parent_qn = self._determine_function_parent(
+                func_node, module_qn, lang_config
+            )
+            self._emit_rel(
+                (parent_type, "qualified_name", parent_qn),
+                "DEFINES",
+                ("Function", "qualified_name", func_qn),
+            )
+
+            # Create export relationship if this is an exported C++ function
+            if is_exported and language == "cpp":
+                self._emit_rel(
+                    ("File", "qualified_name", module_qn),
+                    "EXPORTS",
+                    ("Function", "qualified_name", func_qn),
+                )
+
+    def _build_nested_qualified_name(
+        self,
+        func_node: Node,
+        module_qn: str,
+        func_name: str,
+        lang_config: LanguageConfig,
+        skip_classes: bool = False,
+    ) -> str | None:
+        """Build qualified name for nested functions.
+
+        Args:
+            skip_classes: If True, skip class nodes in the path (used for object literal methods)
+        """
+        path_parts = []
+        current = func_node.parent
+
+        if not isinstance(current, Node):
+            logger.warning(
+                f"Unexpected parent type for node {func_node}: {type(current)}. "
+                f"Skipping."
+            )
+            return None
+
+        while current and current.type not in lang_config.module_node_types:
+            # Handle functions (named and anonymous)
+            if current.type in lang_config.function_node_types:
+                if name_node := current.child_by_field_name("name"):
+                    text = name_node.text
+                    if text is not None:
+                        path_parts.append(text.decode("utf8"))
+                else:
+                    # Check if this is an anonymous function that has been assigned a name
+                    func_name_from_assignment = self._extract_function_name(current)
+                    if func_name_from_assignment:
+                        path_parts.append(func_name_from_assignment)
+            # Handle classes
+            elif current.type in lang_config.class_node_types:
+                if skip_classes:
+                    # For object literal methods, skip the class but continue up the tree
+                    pass
+                else:
+                    # Check if we're inside a method that contains object literals
+                    # If so, include the class name in the path. Otherwise, return None (this is a method)
+                    if self._is_inside_method_with_object_literals(func_node):
+                        if name_node := current.child_by_field_name("name"):
+                            text = name_node.text
+                            if text is not None:
+                                path_parts.append(text.decode("utf8"))
+                    else:
+                        # Regular class method - return None
+                        return None
+            # Handle methods inside classes
+            elif current.type == "method_definition":
+                if name_node := current.child_by_field_name("name"):
+                    text = name_node.text
+                    if text is not None:
+                        path_parts.append(text.decode("utf8"))
+
+            current = current.parent
+
+        path_parts.reverse()
+        if path_parts:
+            return f"{module_qn}.{'.'.join(path_parts)}.{func_name}"
+        else:
+            return f"{module_qn}.{func_name}"
+
+    def _build_nested_qualified_name_for_class(
+        self,
+        class_node: Node,
+        module_qn: str,
+        class_name: str,
+        lang_config: LanguageConfig,
+    ) -> str | None:
+        """Build qualified name for classes inside inline modules."""
+        if not isinstance(class_node.parent, Node):
+            return None
+
+        # Use the shared helper which handles both Rust modules and nested classes
+        path_parts = build_rust_module_path(
+            class_node,
+            include_classes=True,
+            class_node_types=lang_config.class_node_types,
+        )
+
+        if path_parts:
+            return f"{module_qn}.{'.'.join(path_parts)}.{class_name}"
+        return None
+
+    def _build_rust_method_qualified_name(
+        self, method_node: Node, module_qn: str, method_name: str
+    ) -> str:
+        """Build qualified name for Rust methods, handling impl blocks and modules."""
+        path_parts = build_rust_module_path(method_node, include_impl_targets=True)
+        if path_parts:
+            return f"{module_qn}.{'.'.join(path_parts)}.{method_name}"
+        return f"{module_qn}.{method_name}"
+
+    def _build_rust_function_qualified_name(
+        self, func_node: Node, module_qn: str, func_name: str
+    ) -> str:
+        """Build qualified name for Rust functions, handling inline modules."""
+        path_parts = build_rust_module_path(func_node)
+        if path_parts:
+            return f"{module_qn}.{'.'.join(path_parts)}.{func_name}"
+        return f"{module_qn}.{func_name}"
+
+    def _is_method(self, func_node: Node, lang_config: LanguageConfig) -> bool:
+        """Check if a function is actually a method inside a class."""
+        current = func_node.parent
+        if not isinstance(current, Node):
+            return False
+
+        while current and current.type not in lang_config.module_node_types:
+            if current.type in lang_config.class_node_types:
+                return True
+            current = current.parent
+        return False
+
+    def _determine_function_parent(
+        self, func_node: Node, module_qn: str, lang_config: LanguageConfig
+    ) -> tuple[str, str]:
+        """Determine the parent of a function (File or another Function)."""
+        current = func_node.parent
+        if not isinstance(current, Node):
+            return "File", module_qn
+
+        while current and current.type not in lang_config.module_node_types:
+            if current.type in lang_config.function_node_types:
+                if name_node := current.child_by_field_name("name"):
+                    parent_text = name_node.text
+                    if parent_text is None:
+                        continue
+                    parent_func_name = parent_text.decode("utf8")
+                    if parent_func_qn := self._build_nested_qualified_name(
+                        current, module_qn, parent_func_name, lang_config
+                    ):
+                        return "Function", parent_func_qn
+                break
+
+            current = current.parent
+
+        return "File", module_qn
+
+    def _ingest_cpp_module_declarations(
+        self, root_node: Node, module_qn: str, file_path: Path, queries: dict[str, Any]
+    ) -> None:
+        """Process C++20 module declarations and create appropriate Module nodes."""
+        # Parse the AST to find module declarations
+        module_declarations = []
+
+        def find_module_declarations(node: Node) -> None:
+            """Recursively find module-related declarations."""
+            # Look for actual module_declaration nodes in AST
+            if node.type == "module_declaration":
+                text = node.text.decode("utf-8").strip() if node.text else ""
+                module_declarations.append((node, text))
+
+            # Also check for module declarations that might be under other node types
+            elif node.type == "declaration":
+                # Check if this declaration contains module keywords as children
+                has_module = False
+
+                for child in node.children:
+                    if child.type == "module" or (
+                        child.text and child.text.decode("utf-8").strip() == "module"
+                    ):
+                        has_module = True
+
+                if has_module:
+                    text = node.text.decode("utf-8").strip() if node.text else ""
+                    module_declarations.append((node, text))
+
+            for child in node.children:
+                find_module_declarations(child)
+
+        find_module_declarations(root_node)
+
+        # Process each module declaration found
+        for decl_node, decl_text in module_declarations:
+            if decl_text.startswith("export module "):
+                # This is a module interface unit
+                parts = decl_text.split()
+                if len(parts) >= 3:
+                    module_name = parts[2].rstrip(";")
+
+                    # Create a ModuleInterface node
+                    interface_qn = f"{self.project_name}.{module_name}"
+                    try:
+                        relative_path = file_path.relative_to(self.repo_path)
+                    except ValueError:
+                        logger.warning(
+                            f"File not relative to repo_path, skipping: {file_path}"
+                        )
+                        continue
+                    self._emit_node(
+                        "ModuleInterface",
+                        {
+                            "qualified_name": interface_qn,
+                            "name": module_name,
+                            "path": str(relative_path),
+                            "module_type": "interface",
+                        },
+                    )
+
+                    # Link the ModuleInterface to the current Module (file)
+                    self._emit_rel(
+                        ("File", "qualified_name", module_qn),
+                        "EXPORTS_MODULE",
+                        ("ModuleInterface", "qualified_name", interface_qn),
+                    )
+
+                    logger.debug(f"  Found C++ Module Interface: {interface_qn}")
+
+            elif decl_text.startswith("module ") and not decl_text.startswith(
+                "module ;"
+            ):
+                # This is a module implementation unit
+                parts = decl_text.split()
+                if len(parts) >= 2:
+                    module_name = parts[1].rstrip(";")
+
+                    # Create a ModuleImplementation node
+                    impl_qn = f"{self.project_name}.{module_name}_impl"
+                    try:
+                        relative_path = file_path.relative_to(self.repo_path)
+                    except ValueError:
+                        logger.warning(
+                            f"File not relative to repo_path, skipping: {file_path}"
+                        )
+                        continue
+                    self._emit_node(
+                        "ModuleImplementation",
+                        {
+                            "qualified_name": impl_qn,
+                            "name": f"{module_name}_impl",
+                            "path": str(relative_path),
+                            "implements_module": module_name,
+                            "module_type": "implementation",
+                        },
+                    )
+
+                    # Link the ModuleImplementation to the current Module (file)
+                    self._emit_rel(
+                        ("File", "qualified_name", module_qn),
+                        "IMPLEMENTS_MODULE",
+                        ("ModuleImplementation", "qualified_name", impl_qn),
+                    )
+
+                    # Try to link to the module interface if it exists
+                    interface_qn = f"{self.project_name}.{module_name}"
+                    self._emit_rel(
+                        ("ModuleImplementation", "qualified_name", impl_qn),
+                        "IMPLEMENTS",
+                        ("ModuleInterface", "qualified_name", interface_qn),
+                    )
+
+                    logger.debug(f"  Found C++ Module Implementation: {impl_qn}")
+
+    def _find_cpp_exported_classes(
+        self, root_node: Node, max_nodes: int = 50000
+    ) -> list[Node]:
+        """Find C++ exported classes that are misclassified as function_definition due to Tree-sitter grammar limitations.
+
+        Args:
+            max_nodes: Maximum number of nodes to visit to prevent hangs on huge ASTs.
+        """
+        exported_class_nodes = []
+
+        # Use iterative approach instead of recursion to prevent stack overflow
+        stack: list[Node] = [root_node]
+        visited_count = 0
+
+        while stack and visited_count < max_nodes:
+            node = stack.pop()
+            visited_count += 1
+
+            # Look for function_definition nodes that are actually exported classes/structs
+            if node.type == "function_definition":
+                # Check if this function_definition is actually an exported class
+                node_text = node.text.decode("utf-8").strip() if node.text else ""
+
+                # Look for patterns like "export class", "export struct", "export template"
+                if (
+                    node_text.startswith("export class ")
+                    or node_text.startswith("export struct ")
+                    or node_text.startswith("export template")
+                ):
+                    # Additional check: see if it has ERROR nodes for "class" or "struct"
+                    found_error_class = False
+                    for child in node.children:
+                        if child.type == "ERROR" and child.text:
+                            error_text = child.text.decode("utf-8")
+                            if error_text in ["class", "struct"]:
+                                exported_class_nodes.append(node)
+                                found_error_class = True
+                                break
+
+                    if not found_error_class:
+                        # If no ERROR node found but text suggests it's a class, still include it
+                        if (
+                            "export class " in node_text
+                            or "export struct " in node_text
+                        ):
+                            exported_class_nodes.append(node)
+
+            # Add children to stack (in reverse order to maintain left-to-right processing)
+            stack.extend(reversed(node.children))
+
+        return exported_class_nodes
+
+    def _ingest_classes_and_methods(
+        self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
+    ) -> None:
+        """Extract and ingest classes and their methods."""
+        lang_queries = queries[language]
+        # Languages without classes (e.g., Lua) will not have a classes query
+        if not lang_queries.get("classes"):
+            return
+
+        lang_config: LanguageConfig = lang_queries["config"]
+
+        query = lang_queries["classes"]
+        cursor = QueryCursor(query)
+        captures = cursor.captures(root_node)
+        class_nodes = captures.get("class", [])
+        module_nodes = captures.get("module", [])
+
+        # For C++, also check for misclassified exported classes due to Tree-sitter grammar limitations
+        if language == "cpp":
+            additional_class_nodes = self._find_cpp_exported_classes(root_node)
+            class_nodes.extend(additional_class_nodes)
+
+        for class_node in class_nodes:
+            if not isinstance(class_node, Node):
+                continue
+            # Use C++ specific class name extraction for C++ language
+            if language == "cpp":
+                # Handle both normal classes and misclassified exported classes
+                if class_node.type == "function_definition":
+                    # This is a misclassified exported class - extract name differently
+                    class_name = extract_cpp_exported_class_name(class_node)
+                    is_exported = True  # We know it's exported because we found it in the exported classes search
+                else:
+                    # Normal class processing
+                    class_name = self._extract_cpp_class_name(class_node)
+                    is_exported = is_cpp_exported(class_node)
+
+                if not class_name:
+                    continue
+                class_qn = build_cpp_qualified_name(class_node, module_qn, class_name)
+            elif language == "rust" and class_node.type == "impl_item":
+                # Special handling for Rust impl blocks
+
+                # Extract the type being implemented for
+                impl_target = extract_rust_impl_target(class_node)
+                if not impl_target:
+                    continue
+
+                # The impl block itself is not a class, but we need to process its methods
+                # and associate them with the actual struct/enum
+                class_qn = f"{module_qn}.{impl_target}"
+
+                # Process methods in the impl block
+                body_node = class_node.child_by_field_name("body")
+                if body_node:
+                    method_query = lang_queries["functions"]
+                    method_cursor = QueryCursor(method_query)
+                    method_captures = method_cursor.captures(body_node)
+                    method_nodes = method_captures.get("function", [])
+                    for method_node in method_nodes:
+                        if not isinstance(method_node, Node):
+                            continue
+
+                        ingest_method(
+                            method_node,
+                            class_qn,
+                            "Class",
+                            self.ingestor,
+                            self.function_registry,
+                            self.simple_name_lookup,
+                            self._get_docstring,
+                            language,
+                            file_path=getattr(self._current_file_path, "value", None),
+                            emit_node=self._emit_node,
+                            emit_rel=self._emit_rel,
+                            queue_registry_entry=self._queue_registry_entry,
+                            add_simple_name=self._add_simple_name,
+                        )
+
+                # Skip the rest of the processing for impl blocks
+                continue
+            else:
+                is_exported = False  # Default for non-C++ languages
+                class_name = self._extract_class_name(class_node)
+                if not class_name:
+                    continue
+                # Build nested qualified name for classes inside inline modules
+                nested_qn = self._build_nested_qualified_name_for_class(
+                    class_node, module_qn, class_name, lang_config
+                )
+                class_qn = nested_qn if nested_qn else f"{module_qn}.{class_name}"
+            decorators = self._extract_decorators(class_node)
+            class_props: dict[str, Any] = {
+                "qualified_name": class_qn,
+                "name": class_name,
+                "decorators": decorators,
+                "start_line": class_node.start_point[0] + 1,
+                "end_line": class_node.end_point[0] + 1,
+                "docstring": self._get_docstring(class_node),
+                "is_exported": is_exported,
+                "path": getattr(self._current_file_path, "value", None),
+            }
+            # Determine the correct node type based on the AST node type
+            if class_node.type == "interface_declaration":
+                node_type = "Interface"
+                logger.debug(f"  Found Interface: {class_name} (qn: {class_qn})")
+            elif class_node.type in [
+                "enum_declaration",
+                "enum_specifier",
+                "enum_class_specifier",
+            ]:
+                node_type = "Enum"
+                logger.debug(f"  Found Enum: {class_name} (qn: {class_qn})")
+            elif class_node.type == "type_alias_declaration":
+                node_type = "Type"
+                logger.debug(f"  Found Type: {class_name} (qn: {class_qn})")
+            elif class_node.type == "struct_specifier":
+                node_type = "Class"  # In C++, structs are essentially classes
+                logger.debug(f"  Found Struct: {class_name} (qn: {class_qn})")
+            elif class_node.type == "union_specifier":
+                node_type = "Union"
+                logger.debug(f"  Found Union: {class_name} (qn: {class_qn})")
+            elif class_node.type == "template_declaration":
+                # For template classes, check the actual class type within
+                template_class = self._extract_template_class_type(class_node)
+                node_type = template_class if template_class else "Class"
+                logger.debug(
+                    f"  Found Template {node_type}: {class_name} (qn: {class_qn})"
+                )
+            elif class_node.type == "function_definition" and language == "cpp":
+                # This is a misclassified exported class - determine type from text
+                node_text = class_node.text.decode("utf-8") if class_node.text else ""
+                if "export struct " in node_text:
+                    node_type = "Class"  # In C++, structs are essentially classes
+                    logger.debug(
+                        f"  Found Exported Struct: {class_name} (qn: {class_qn})"
+                    )
+                elif "export union " in node_text:
+                    node_type = "Class"  # In C++, unions are also class-like
+                    logger.debug(
+                        f"  Found Exported Union: {class_name} (qn: {class_qn})"
+                    )
+                elif "export template" in node_text:
+                    node_type = "Class"  # Template class
+                    logger.debug(
+                        f"  Found Exported Template Class: {class_name} (qn: {class_qn})"
+                    )
+                else:
+                    node_type = "Class"  # Default to Class for exported classes
+                    logger.debug(
+                        f"  Found Exported Class: {class_name} (qn: {class_qn})"
+                    )
+            else:
+                node_type = "Class"
+                logger.debug(f"  Found Class: {class_name} (qn: {class_qn})")
+
+            logger.debug(f"    -> Ingesting class node: {class_qn}")
+            self._emit_node(node_type, class_props)
+
+            # Register the class/interface/enum itself in the function registry
+            self._queue_registry_entry(class_qn, node_type)
+            self._add_simple_name(class_name, class_qn)
+
+            # Track inheritance
+            logger.debug(f"    -> Extracting parent classes for: {class_qn}")
+            parent_classes = self._extract_parent_classes(class_node, module_qn)
+            self._set_class_inheritance(class_qn, parent_classes)
+
+            self._emit_rel(
+                ("File", "qualified_name", module_qn),
+                "DEFINES",
+                (node_type, "qualified_name", class_qn),
+            )
+
+            # Create export relationship if this is an exported C++ class
+            if is_exported and language == "cpp":
+                self._emit_rel(
+                    ("File", "qualified_name", module_qn),
+                    "EXPORTS",
+                    (node_type, "qualified_name", class_qn),
+                )
+
+            # Create INHERITS relationships for each parent class
+            for parent_class_qn in parent_classes:
+                self._create_inheritance_relationship(
+                    node_type, class_qn, parent_class_qn
+                )
+
+            # Handle Java interface implementations
+            if class_node.type == "class_declaration":
+                implemented_interfaces = self._extract_implemented_interfaces(
+                    class_node, module_qn
+                )
+                for interface_qn in implemented_interfaces:
+                    self._create_implements_relationship(
+                        node_type, class_qn, interface_qn
+                    )
+
+            body_node = class_node.child_by_field_name("body")
+            if not body_node:
+                logger.debug(f"    -> No body node for class: {class_qn}")
+                continue
+
+            logger.debug(f"    -> Querying methods in class: {class_qn}")
+            method_query = lang_queries["functions"]
+            method_cursor = QueryCursor(method_query)
+            method_captures = method_cursor.captures(body_node)
+            method_nodes = method_captures.get("function", [])
+            logger.debug(
+                f"    -> Found {len(method_nodes)} methods in class: {class_qn}"
+            )
+            for method_node in method_nodes:
+                if not isinstance(method_node, Node):
+                    continue
+
+                # Handle Java method overloading with parameter types
+                method_qualified_name = None
+                if language == "java":
+                    method_info = extract_java_method_info(method_node)
+                    method_name = method_info.get("name")
+                    parameters = method_info.get("parameters", [])
+                    if method_name:
+                        if parameters:
+                            # Create method signature with parameter types for overloading
+                            param_signature = "(" + ",".join(parameters) + ")"
+                            method_qualified_name = (
+                                f"{class_qn}.{method_name}{param_signature}"
+                            )
+                        else:
+                            # No parameters, use simple name
+                            method_qualified_name = f"{class_qn}.{method_name}()"
+
+                ingest_method(
+                    method_node,
+                    class_qn,
+                    "Class",
+                    self.ingestor,
+                    self.function_registry,
+                    self.simple_name_lookup,
+                    self._get_docstring,
+                    language,
+                    self._extract_decorators,
+                    method_qualified_name,
+                    file_path=getattr(self._current_file_path, "value", None),
+                    emit_node=self._emit_node,
+                    emit_rel=self._emit_rel,
+                    queue_registry_entry=self._queue_registry_entry,
+                    add_simple_name=self._add_simple_name,
+                )
+
+                # Note: OVERRIDES relationships will be processed later after all methods are collected
+
+        # Process inline modules (like Rust mod items)
+        for module_node in module_nodes:
+            if not isinstance(module_node, Node):
+                continue
+
+            module_name_node = module_node.child_by_field_name("name")
+            if not module_name_node:
+                continue
+            text = module_name_node.text
+            if text is None:
+                continue
+            module_name = text.decode("utf8")
+
+            # Build nested qualified name for inline modules
+            nested_qn = self._build_nested_qualified_name_for_class(
+                module_node, module_qn, module_name, lang_config
+            )
+            inline_module_qn = nested_qn if nested_qn else f"{module_qn}.{module_name}"
+
+            module_props: dict[str, Any] = {
+                "qualified_name": inline_module_qn,
+                "name": module_name,
+                # Use qualified_name as path for virtual inline modules to ensure uniqueness
+                "path": f"<inline>/{inline_module_qn}",
+            }
+            logger.debug(
+                f"  Found Inline Module: {module_name} (qn: {inline_module_qn})"
+            )
+            # Rust inline modules are treated as virtual Files
+            self._emit_node("File", module_props)
+
+    def process_all_method_overrides(self) -> None:
+        """Process OVERRIDES relationships for all methods after collection is complete."""
+        logger.info("--- Pass 4: Processing Method Override Relationships ---")
+
+        # Create snapshots ONCE (not per-method) to avoid O(n*m) deep-copy overhead.
+        # Previously, _check_method_overrides copied class_inheritance for every method,
+        # which caused Pass 3 to explode from 8s to 235s on large codebases.
+        with self._class_inheritance_lock:
+            class_inheritance_snapshot = {
+                k: list(v) for k, v in self.class_inheritance.items()
+            }
+
+        # Process all methods to find overrides
+        # Use lock to create a safe snapshot of keys to avoid "dictionary changed size during iteration" error
+        with self._registry_lock:
+            registry_snapshot = list(self.function_registry.items())
+
+        method_count = 0
+        override_count = 0
+        for method_qn, node_type in registry_snapshot:
+            if node_type == "Method":
+                method_count += 1
+                # Extract class_qn and method_name from method_qn
+                if "." in method_qn:
+                    parts = method_qn.rsplit(".", 1)
+                    if len(parts) == 2:
+                        class_qn, method_name = parts
+                        if self._check_method_overrides(
+                            method_qn, method_name, class_qn, class_inheritance_snapshot
+                        ):
+                            override_count += 1
+
+        logger.info(
+            f"Pass 4 complete: checked {method_count} methods, found {override_count} overrides"
+        )
+
+    def _check_method_overrides(
+        self,
+        method_qn: str,
+        method_name: str,
+        class_qn: str,
+        class_inheritance_snapshot: dict[str, list[str]],
+    ) -> bool:
+        """Check if method overrides parent class methods using BFS traversal.
+
+        Args:
+            method_qn: Fully qualified method name
+            method_name: Simple method name
+            class_qn: Fully qualified class name
+            class_inheritance_snapshot: Pre-computed snapshot of class_inheritance dict
+
+        Returns:
+            True if an override relationship was found and created
+        """
+        if class_qn not in class_inheritance_snapshot:
+            return False
+
+        # Use BFS to find the nearest parent method in the inheritance hierarchy
+        queue = deque([class_qn])
+        visited = {class_qn}  # Don't revisit classes (handle diamond inheritance)
+
+        while queue:
+            current_class = queue.popleft()
+
+            # Skip the original class (we're looking for parent methods)
+            if current_class != class_qn:
+                parent_method_qn = f"{current_class}.{method_name}"
+
+                # Check if this parent class has the method
+                if parent_method_qn in self.function_registry:
+                    self._emit_rel(
+                        ("Method", "qualified_name", method_qn),
+                        "OVERRIDES",
+                        ("Method", "qualified_name", parent_method_qn),
+                    )
+                    logger.debug(
+                        f"Method override: {method_qn} OVERRIDES {parent_method_qn}"
+                    )
+                    return True  # Found the nearest override, stop searching
+
+            # Add parent classes to queue for next level of BFS
+            if current_class in class_inheritance_snapshot:
+                for parent_class_qn in class_inheritance_snapshot[current_class]:
+                    if parent_class_qn not in visited:
+                        visited.add(parent_class_qn)
+                        queue.append(parent_class_qn)
+
+        return False  # No override found
+
+    def _parse_cpp_base_classes(
+        self, base_clause_node: Node, class_node: Node, module_qn: str
+    ) -> list[str]:
+        """Parse C++ base class clause to extract all parent classes with full template support."""
+        parent_classes = []
+
+        # Iterate through all children in the base_class_clause
+        for base_child in base_clause_node.children:
+            parent_name = None
+
+            # Handle different types of parent class specifications
+            if base_child.type == "type_identifier":
+                # Simple inheritance: class Derived : public Base
+                if base_child.text:
+                    parent_name = base_child.text.decode("utf8")
+
+            elif base_child.type == "qualified_identifier":
+                # Namespace qualified: class Derived : public ns::Base
+                # Also handles qualified templates: class Derived : public ns::Base<T>
+                if base_child.text:
+                    parent_name = base_child.text.decode("utf8")
+
+            elif base_child.type == "template_type":
+                # Template inheritance: class Derived : public Base<T>
+                if base_child.text:
+                    parent_name = base_child.text.decode("utf8")
+
+            # Skip access specifiers, virtual keyword, commas, and colons
+            elif base_child.type in ["access_specifier", "virtual", ",", ":"]:
+                continue
+
+            if parent_name:
+                # Build proper qualified name
+                # Extract the base class name (handle templates and namespaces)
+                base_name = self._extract_cpp_base_class_name(parent_name)
+                parent_qn = build_cpp_qualified_name(class_node, module_qn, base_name)
+                parent_classes.append(parent_qn)
+                logger.debug(f"Found C++ inheritance: {parent_name} -> {parent_qn}")
+
+        return parent_classes
+
+    def _extract_cpp_base_class_name(self, parent_text: str) -> str:
+        """Extract the base class name from C++ inheritance text, handling templates and namespaces."""
+        # Remove template arguments for qualified name building
+        # Base<T> -> Base, std::vector<int> -> vector, ns::Base<T> -> Base
+
+        # Handle templates first (remove template arguments)
+        if "<" in parent_text:
+            parent_text = parent_text.split("<")[0]
+
+        # Then handle namespace qualification (keep only the last part)
+        if "::" in parent_text:
+            parent_text = parent_text.split("::")[-1]
+
+        return parent_text
+
+    def _resolve_superclass_from_type_identifier(
+        self, type_identifier_node: Node, module_qn: str
+    ) -> str | None:
+        """Resolve a superclass name from a type_identifier node."""
+        parent_text = type_identifier_node.text
+        if parent_text:
+            parent_name = parent_text.decode("utf8")
+            # Resolve to full qualified name if possible
+            return (
+                self._resolve_class_name(parent_name, module_qn)
+                or f"{module_qn}.{parent_name}"
+            )
+        return None
+
+    def _extract_parent_classes(self, class_node: Node, module_qn: str) -> list[str]:
+        """Extract parent class names from a class definition."""
+        parent_classes = []
+
+        # Handle C++ inheritance
+        if class_node.type in ["class_specifier", "struct_specifier"]:
+            # Look for base_class_clause in C++ class definition
+            for child in class_node.children:
+                if child.type == "base_class_clause":
+                    parent_classes.extend(
+                        self._parse_cpp_base_classes(child, class_node, module_qn)
+                    )
+            return parent_classes
+
+        # Look for superclass in Java class definition (extends clause)
+        if class_node.type == "class_declaration":
+            superclass_node = class_node.child_by_field_name("superclass")
+            if superclass_node:
+                # Java superclass is a single type identifier
+                if superclass_node.type == "type_identifier":
+                    resolved_superclass = self._resolve_superclass_from_type_identifier(
+                        superclass_node, module_qn
+                    )
+                    if resolved_superclass:
+                        parent_classes.append(resolved_superclass)
+                else:
+                    # Look for type_identifier children in superclass node
+                    for child in superclass_node.children:
+                        if child.type == "type_identifier":
+                            resolved_superclass = (
+                                self._resolve_superclass_from_type_identifier(
+                                    child, module_qn
+                                )
+                            )
+                            if resolved_superclass:
+                                parent_classes.append(resolved_superclass)
+                                break
+
+        # Look for superclasses in Python class definition
+        superclasses_node = class_node.child_by_field_name("superclasses")
+        if superclasses_node:
+            # Parse the argument_list to get parent classes
+            for child in superclasses_node.children:
+                if child.type == "identifier":
+                    parent_text = child.text
+                    if parent_text:
+                        parent_name = parent_text.decode("utf8")
+                        # Resolve to full qualified name if possible
+                        if module_qn in self.import_processor.import_mapping:
+                            import_map = self.import_processor.import_mapping[module_qn]
+                            if parent_name in import_map:
+                                parent_classes.append(import_map[parent_name])
+                            else:
+                                # Try to resolve within same module
+                                resolved_python_parent: str | None = (
+                                    self._resolve_class_name(parent_name, module_qn)
+                                )
+                                if resolved_python_parent is not None:
+                                    parent_classes.append(resolved_python_parent)
+                                else:
+                                    # Fallback: assume same module
+                                    parent_classes.append(f"{module_qn}.{parent_name}")
+                        else:
+                            # Fallback: assume same module
+                            parent_classes.append(f"{module_qn}.{parent_name}")
+
+        # Look for inheritance in TypeScript/JavaScript class declaration
+        # Structure: class_declaration -> class_heritage -> extends_clause -> identifier
+        # Or in JavaScript: class_declaration -> class_heritage -> extends + identifier
+        class_heritage_node = None
+        for child in class_node.children:
+            if child.type == "class_heritage":
+                class_heritage_node = child
+                break
+
+        if class_heritage_node:
+            # TypeScript pattern: class_heritage -> extends_clause -> identifier
+            for child in class_heritage_node.children:
+                if child.type == "extends_clause":
+                    # Find the parent class identifier in the extends_clause
+                    for grandchild in child.children:
+                        if grandchild.type in ["identifier", "member_expression"]:
+                            parent_text = grandchild.text
+                            if parent_text:
+                                parent_name = parent_text.decode("utf8")
+                                parent_classes.append(
+                                    self._resolve_js_ts_parent_class(
+                                        parent_name, module_qn
+                                    )
+                                )
+                            break
+                    break
+                # JavaScript pattern: class_heritage -> extends + identifier (direct children)
+                elif child.type in ["identifier", "member_expression"]:
+                    # Check if the previous sibling is "extends"
+                    child_index = class_heritage_node.children.index(child)
+                    if (
+                        child_index > 0
+                        and class_heritage_node.children[child_index - 1].type
+                        == "extends"
+                    ):
+                        parent_text = child.text
+                        if parent_text:
+                            parent_name = parent_text.decode("utf8")
+                            parent_classes.append(
+                                self._resolve_js_ts_parent_class(parent_name, module_qn)
+                            )
+                # Handle mixin patterns: class_heritage -> extends + call_expression
+                elif child.type == "call_expression":
+                    # Check if the previous sibling is "extends"
+                    child_index = class_heritage_node.children.index(child)
+                    if (
+                        child_index > 0
+                        and class_heritage_node.children[child_index - 1].type
+                        == "extends"
+                    ):
+                        # For mixin calls like Swimmable(Animal), extract the base class from arguments
+                        parent_classes.extend(
+                            self._extract_mixin_parent_classes(child, module_qn)
+                        )
+
+        # Look for TypeScript interface inheritance patterns
+        # Structure: interface_declaration -> extends_type_clause -> type_identifier
+        if class_node.type == "interface_declaration":
+            # Look for extends_type_clause (TypeScript interface inheritance)
+            extends_type_clause_node = None
+            for child in class_node.children:
+                if child.type == "extends_type_clause":
+                    extends_type_clause_node = child
+                    break
+
+            if extends_type_clause_node:
+                # Parse interface inheritance from extends_type_clause
+                # Pattern: extends_type_clause contains extends + type_identifier(s)
+                for child in extends_type_clause_node.children:
+                    if child.type == "type_identifier":
+                        # Direct type_identifier inheritance
+                        parent_text = child.text
+                        if parent_text:
+                            parent_name = parent_text.decode("utf8")
+                            parent_classes.append(
+                                self._resolve_js_ts_parent_class(parent_name, module_qn)
+                            )
+
+        return parent_classes
+
+    def _extract_mixin_parent_classes(
+        self, call_expr_node: Node, module_qn: str
+    ) -> list[str]:
+        """Extract parent classes from mixin call expressions like Swimmable(Animal)."""
+        parent_classes = []
+
+        # Look for arguments in the call expression
+        for child in call_expr_node.children:
+            if child.type == "arguments":
+                # Extract all identifiers from the arguments
+                for arg_child in child.children:
+                    if arg_child.type == "identifier" and arg_child.text:
+                        parent_name = arg_child.text.decode("utf8")
+                        parent_classes.append(
+                            self._resolve_js_ts_parent_class(parent_name, module_qn)
+                        )
+                    elif arg_child.type == "call_expression":
+                        # Handle nested mixins like Swimmable(Flyable(Animal))
+                        parent_classes.extend(
+                            self._extract_mixin_parent_classes(arg_child, module_qn)
+                        )
+                break
+
+        return parent_classes
+
+    def _resolve_js_ts_parent_class(self, parent_name: str, module_qn: str) -> str:
+        """Resolve a JavaScript/TypeScript parent class name to its fully qualified name."""
+        # Resolve to full qualified name if possible
+        if module_qn in self.import_processor.import_mapping:
+            import_map = self.import_processor.import_mapping[module_qn]
+            if parent_name in import_map:
+                return import_map[parent_name]
+            else:
+                # Try to resolve within same module
+                parent_qn = self._resolve_class_name(parent_name, module_qn)
+                if parent_qn is not None:
+                    return parent_qn
+                else:
+                    # Fallback: assume same module
+                    return f"{module_qn}.{parent_name}"
+        else:
+            # Fallback: assume same module
+            return f"{module_qn}.{parent_name}"
+
+    def _resolve_class_name(self, class_name: str, module_qn: str) -> str | None:
+        """Convert a simple class name to its fully qualified name."""
+        return resolve_class_name(
+            class_name,
+            module_qn,
+            self.import_processor,
+            self.function_registry,
+            simple_name_lookup=self.simple_name_lookup,
+        )
+
+    def _ingest_prototype_inheritance(
+        self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
+    ) -> None:
+        """Detect JavaScript prototype inheritance patterns using tree-sitter queries."""
+        if language not in JS_TYPESCRIPT_LANGUAGES:
+            return
+
+        # Handle prototype inheritance links
+        self._ingest_prototype_inheritance_links(
+            root_node, module_qn, language, queries
+        )
+
+        # Handle prototype method assignments
+        self._ingest_prototype_method_assignments(
+            root_node, module_qn, language, queries
+        )
+
+    def _ingest_prototype_inheritance_links(
+        self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
+    ) -> None:
+        """Detect prototype inheritance links (Child.prototype = Object.create(Parent.prototype))."""
+        lang_queries = queries[language]
+
+        # Get the language object for creating queries
+        language_obj = lang_queries.get("language")
+        if not language_obj:
+            return
+
+        # Create a query to find prototype inheritance patterns
+        # Pattern: Child.prototype = Object.create(Parent.prototype)
+        query_text = """
+        (assignment_expression
+          left: (member_expression
+            object: (identifier) @child_class
+            property: (property_identifier) @prototype (#eq? @prototype "prototype"))
+          right: (call_expression
+            function: (member_expression
+              object: (identifier) @object_name (#eq? @object_name "Object")
+              property: (property_identifier) @create_method (#eq? @create_method "create"))
+            arguments: (arguments
+              (member_expression
+                object: (identifier) @parent_class
+                property: (property_identifier) @parent_prototype (#eq? @parent_prototype "prototype")))))
+        """
+
+        try:
+            # Create and execute the query for inheritance
+            query = Query(language_obj, query_text)
+            cursor = QueryCursor(query)
+            captures = cursor.captures(root_node)
+
+            # Extract child and parent class names from captures
+            child_classes = captures.get("child_class", [])
+            parent_classes = captures.get("parent_class", [])
+
+            if child_classes and parent_classes:
+                for child_node, parent_node in zip(child_classes, parent_classes):
+                    if not child_node.text or not parent_node.text:
+                        continue
+                    child_name = child_node.text.decode("utf8")
+                    parent_name = parent_node.text.decode("utf8")
+
+                    # Build qualified names
+                    child_qn = f"{module_qn}.{child_name}"
+                    parent_qn = f"{module_qn}.{parent_name}"
+
+                    # Add to inheritance tracking (thread-safe)
+                    self._add_class_parent(child_qn, parent_qn)
+
+                    # Create inheritance relationship
+                    self._emit_rel(
+                        ("Function", "qualified_name", child_qn),
+                        "INHERITS",
+                        ("Function", "qualified_name", parent_qn),
+                    )
+
+                    logger.debug(
+                        f"Prototype inheritance: {child_qn} INHERITS {parent_qn}"
+                    )
+
+        except Exception as e:
+            logger.debug(f"Failed to detect prototype inheritance: {e}")
+
+    def _ingest_prototype_method_assignments(
+        self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
+    ) -> None:
+        """Detect prototype method assignments (Constructor.prototype.method = function() {})."""
+        lang_queries = queries[language]
+
+        # Get the language object for creating queries
+        language_obj = lang_queries.get("language")
+        if not language_obj:
+            return
+
+        # Detect prototype method assignments: ConstructorFunction.prototype.methodName = function() { ... }
+        prototype_method_query = """
+        (assignment_expression
+          left: (member_expression
+            object: (member_expression
+              object: (identifier) @constructor_name
+              property: (property_identifier) @prototype_keyword (#eq? @prototype_keyword "prototype"))
+            property: (property_identifier) @method_name)
+          right: (function_expression) @method_function)
+        """
+
+        try:
+            method_query = Query(language_obj, prototype_method_query)
+            method_cursor = QueryCursor(method_query)
+            method_captures = method_cursor.captures(root_node)
+
+            constructor_names = method_captures.get("constructor_name", [])
+            method_names = method_captures.get("method_name", [])
+            method_functions = method_captures.get("method_function", [])
+
+            for constructor_node, method_node, func_node in zip(
+                constructor_names, method_names, method_functions
+            ):
+                constructor_name = (
+                    constructor_node.text.decode("utf8")
+                    if constructor_node.text
+                    else None
+                )
+                method_name = (
+                    method_node.text.decode("utf8") if method_node.text else None
+                )
+
+                if constructor_name and method_name:
+                    # Create the method as a Function node for prototype methods
+                    # Tests expect prototype methods to be in Function nodes
+                    constructor_qn = f"{module_qn}.{constructor_name}"
+                    method_qn = f"{constructor_qn}.{method_name}"
+
+                    # Create Function node for prototype method
+                    method_props = {
+                        "qualified_name": method_qn,
+                        "name": method_name,
+                        "start_line": func_node.start_point[0] + 1,
+                        "end_line": func_node.end_point[0] + 1,
+                        "docstring": self._get_docstring(func_node),
+                        "path": getattr(self._current_file_path, "value", None),
+                    }
+                    logger.debug(
+                        f"  Found Prototype Method: {method_name} (qn: {method_qn})"
+                    )
+                    self._emit_node("Function", method_props)
+
+                    # Register in function registry as Function
+                    self._queue_registry_entry(method_qn, "Function")
+                    self._add_simple_name(method_name, method_qn)
+
+                    # Create relationship from constructor to method
+                    self._emit_rel(
+                        ("Function", "qualified_name", constructor_qn),
+                        "DEFINES",
+                        ("Function", "qualified_name", method_qn),
+                    )
+
+                    logger.debug(
+                        f"Prototype method: {constructor_qn} DEFINES {method_qn}"
+                    )
+
+        except Exception as e:
+            logger.debug(f"Failed to detect prototype methods: {e}")
+
+    def _ingest_missing_import_patterns(
+        self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
+    ) -> None:
+        """Detect import patterns not handled by the existing import_processor."""
+        if language not in JS_TYPESCRIPT_LANGUAGES:
+            return
+
+        lang_queries = queries[language]
+
+        # Get the language object for creating queries
+        language_obj = lang_queries.get("language")
+        if not language_obj:
+            return
+
+        try:
+            # Focus only on CommonJS destructuring which import_processor doesn't handle well
+            # Handle both shorthand ({ name }) and aliased ({ name: alias }) destructuring
+            # More specific query to find only CommonJS destructuring with require
+            commonjs_destructure_query = """
+            (lexical_declaration
+              (variable_declarator
+                name: (object_pattern)
+                value: (call_expression
+                  function: (identifier) @func (#eq? @func "require")
+                )
+              ) @variable_declarator
+            )
+            """
+
+            try:
+                query = Query(language_obj, commonjs_destructure_query)
+                cursor = QueryCursor(query)
+                captures = cursor.captures(root_node)
+
+                # Get all variable declarators
+                variable_declarators = captures.get("variable_declarator", [])
+
+                # Process each variable declarator separately
+                for declarator in variable_declarators:
+                    self._process_variable_declarator_for_commonjs(
+                        declarator, module_qn
+                    )
+
+            except Exception as e:
+                logger.debug(f"Failed to process CommonJS destructuring pattern: {e}")
+
+        except Exception as e:
+            logger.debug(f"Failed to detect missing import patterns: {e}")
+
+    def _process_variable_declarator_for_commonjs(
+        self, declarator: Node, module_qn: str
+    ) -> None:
+        """Process a single variable declarator to extract CommonJS destructuring imports."""
+        try:
+            # Check if this is a destructuring assignment with a require call
+            # Pattern: const { name1, name2: alias } = require('module')
+
+            # Find the name (left side) - should be an object_pattern for destructuring
+            name_node = declarator.child_by_field_name("name")
+            if not name_node or name_node.type != "object_pattern":
+                return
+
+            # Find the value (right side) - should be a require call
+            value_node = declarator.child_by_field_name("value")
+            if not value_node or value_node.type != "call_expression":
+                return
+
+            # Check if the call is to 'require'
+            function_node = value_node.child_by_field_name("function")
+            if not function_node or function_node.type != "identifier":
+                return
+
+            if (
+                function_node.text is None
+                or function_node.text.decode("utf8") != "require"
+            ):
+                return
+
+            # Extract the module name from require arguments
+            arguments_node = value_node.child_by_field_name("arguments")
+            if not arguments_node or not arguments_node.children:
+                return
+
+            # Get the first argument (module name string)
+            module_string_node = None
+            for child in arguments_node.children:
+                if child.type == "string":
+                    module_string_node = child
+                    break
+
+            if not module_string_node or module_string_node.text is None:
+                return
+
+            module_name = module_string_node.text.decode("utf8").strip("'\"")
+
+            # Now extract all destructured variables from the object pattern
+            for child in name_node.children:
+                if child.type == "shorthand_property_identifier_pattern":
+                    # Handle shorthand destructuring: { name }
+                    if child.text is not None:
+                        destructured_name = child.text.decode("utf8")
+                        self._process_commonjs_import(
+                            destructured_name, module_name, module_qn
+                        )
+
+                elif child.type == "pair_pattern":
+                    # Handle aliased destructuring: { name: alias }
+                    key_node = child.child_by_field_name("key")
+                    value_node = child.child_by_field_name("value")
+
+                    if (
+                        key_node
+                        and key_node.type == "property_identifier"
+                        and value_node
+                        and value_node.type == "identifier"
+                    ):
+                        if value_node.text is not None:
+                            alias_name = value_node.text.decode("utf8")
+                            self._process_commonjs_import(
+                                alias_name, module_name, module_qn
+                            )
+
+        except Exception as e:
+            logger.debug(f"Failed to process variable declarator for CommonJS: {e}")
+
+    def _process_commonjs_import(
+        self, imported_name: str, module_name: str, module_qn: str
+    ) -> None:
+        """Process a single CommonJS import (either shorthand or aliased)."""
+        try:
+            # Use the existing import_processor's path resolution
+            resolved_source_module = self.import_processor._resolve_js_module_path(
+                module_name, module_qn
+            )
+
+            # Check if this import relationship already exists to avoid duplicates
+            import_key = f"{module_qn}->{resolved_source_module}"
+            if import_key not in getattr(self, "_processed_imports", set()):
+                # Create the source file node if it doesn't exist
+                # Use a virtual path for external/unresolved modules
+                self._emit_node(
+                    "File",
+                    {
+                        "qualified_name": resolved_source_module,
+                        "name": resolved_source_module,
+                        "path": f"<external>/{resolved_source_module}",
+                    },
+                )
+
+                # Create the relationship
+                self._emit_rel(
+                    ("File", "qualified_name", module_qn),
+                    "IMPORTS",
+                    (
+                        "File",
+                        "qualified_name",
+                        resolved_source_module,
+                    ),
+                )
+
+                logger.debug(
+                    f"Missing pattern: {module_qn} IMPORTS {imported_name} from {resolved_source_module}"
+                )
+
+                # Track processed imports to avoid duplicates
+                if not hasattr(self, "_processed_imports"):
+                    self._processed_imports = set()
+                self._processed_imports.add(import_key)
+
+        except Exception as e:
+            logger.debug(f"Failed to process CommonJS import {imported_name}: {e}")
+
+    def _ingest_object_literal_methods(
+        self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
+    ) -> None:
+        """Detect and ingest methods defined in object literals."""
+        if language not in JS_TYPESCRIPT_LANGUAGES:
+            return
+
+        lang_queries = queries[language]
+
+        # Get the language object for creating queries
+        language_obj = lang_queries.get("language")
+        if not language_obj:
+            return
+
+        try:
+            # Query for object literal methods (pair with function_expression)
+            object_method_query = """
+            (pair
+              key: (property_identifier) @method_name
+              value: (function_expression) @method_function)
+            """
+
+            # Query for method definitions in object literals inside functions
+            # Only matches methods that are truly nested within function contexts
+            method_def_query = """
+            (object
+              (method_definition
+                name: (property_identifier) @method_name) @method_function)
+            """
+
+            # Process both patterns
+            for query_text in [object_method_query, method_def_query]:
+                try:
+                    query = Query(language_obj, query_text)
+                    cursor = QueryCursor(query)
+                    captures = cursor.captures(root_node)
+
+                    method_names = captures.get("method_name", [])
+                    method_functions = captures.get("method_function", [])
+
+                    for method_name_node, method_func_node in zip(
+                        method_names, method_functions
+                    ):
+                        if method_name_node.text and method_func_node:
+                            method_name = method_name_node.text.decode("utf8")
+
+                            # Skip if this is a regular class method (not object literal inside a method)
+                            if self._is_class_method(
+                                method_func_node
+                            ) and not self._is_inside_method_with_object_literals(
+                                method_func_node
+                            ):
+                                continue
+
+                            # Get language config for nested name building
+                            lang_config = lang_queries.get("config")
+                            if lang_config:
+                                # Build proper nested qualified name for object method
+                                method_qn = self._build_object_method_qualified_name(
+                                    method_name_node,
+                                    method_func_node,
+                                    module_qn,
+                                    method_name,
+                                    lang_config,
+                                )
+                                if method_qn is None:
+                                    method_qn = f"{module_qn}.{method_name}"
+                            else:
+                                # Fallback to old logic if no config
+                                object_name = self._find_object_name_for_method(
+                                    method_name_node
+                                )
+                                if object_name:
+                                    method_qn = (
+                                        f"{module_qn}.{object_name}.{method_name}"
+                                    )
+                                else:
+                                    method_qn = f"{module_qn}.{method_name}"
+
+                            # Create Function node for object literal method
+                            method_props = {
+                                "qualified_name": method_qn,
+                                "name": method_name,
+                                "start_line": method_func_node.start_point[0] + 1,
+                                "end_line": method_func_node.end_point[0] + 1,
+                                "docstring": self._get_docstring(method_func_node),
+                                "path": getattr(self._current_file_path, "value", None),
+                            }
+                            logger.debug(
+                                f"  Found Object Method: {method_name} (qn: {method_qn})"
+                            )
+                            self._emit_node("Function", method_props)
+
+                            # Register in function registry
+                            self._queue_registry_entry(method_qn, "Function")
+                            self._add_simple_name(method_name, method_qn)
+
+                            # Create relationship from module to method
+                            self._emit_rel(
+                                ("File", "qualified_name", module_qn),
+                                "DEFINES",
+                                ("Function", "qualified_name", method_qn),
+                            )
+
+                except Exception as e:
+                    logger.debug(f"Failed to process object literal methods: {e}")
+
+        except Exception as e:
+            logger.debug(f"Failed to detect object literal methods: {e}")
+
+    def _ingest_commonjs_exports(
+        self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
+    ) -> None:
+        """Detect and ingest CommonJS exports as function definitions."""
+        if language not in JS_TYPESCRIPT_LANGUAGES:
+            return
+
+        lang_queries = queries[language]
+        language_obj = lang_queries.get("language")
+        if not language_obj:
+            return
+
+        try:
+            # Query for exports.name = function patterns
+            exports_function_query = """
+            (assignment_expression
+              left: (member_expression
+                object: (identifier) @exports_obj
+                property: (property_identifier) @export_name)
+              right: [(function_expression) (arrow_function)] @export_function)
+            """
+
+            # Query for module.exports.name = function patterns
+            module_exports_query = """
+            (assignment_expression
+              left: (member_expression
+                object: (member_expression
+                  object: (identifier) @module_obj
+                  property: (property_identifier) @exports_prop)
+                property: (property_identifier) @export_name)
+              right: [(function_expression) (arrow_function)] @export_function)
+            """
+
+            for query_text in [exports_function_query, module_exports_query]:
+                try:
+                    query = Query(language_obj, query_text)
+                    cursor = QueryCursor(query)
+                    captures = cursor.captures(root_node)
+
+                    exports_objs = captures.get("exports_obj", [])
+                    module_objs = captures.get("module_obj", [])
+                    exports_props = captures.get("exports_prop", [])
+                    export_names = captures.get("export_name", [])
+                    export_functions = captures.get("export_function", [])
+
+                    # Process exports.name = function patterns
+                    for exports_obj, export_name, export_function in zip(
+                        exports_objs, export_names, export_functions
+                    ):
+                        if (
+                            exports_obj.text
+                            and export_name.text
+                            and exports_obj.text.decode("utf8") == "exports"
+                        ):
+                            function_name = export_name.text.decode("utf8")
+                            ingest_exported_function(
+                                export_function,
+                                function_name,
+                                module_qn,
+                                "CommonJS Export",
+                                self.ingestor,
+                                self.function_registry,
+                                self.simple_name_lookup,
+                                self._get_docstring,
+                                self._is_export_inside_function,
+                                file_path=getattr(
+                                    self._current_file_path, "value", None
+                                ),
+                                emit_node=self._emit_node,
+                                queue_registry_entry=self._queue_registry_entry,
+                                add_simple_name=self._add_simple_name,
+                            )
+
+                    # Process module.exports.name = function patterns
+                    for (
+                        module_obj,
+                        exports_prop,
+                        export_name,
+                        export_function,
+                    ) in zip(
+                        module_objs, exports_props, export_names, export_functions
+                    ):
+                        if (
+                            module_obj.text
+                            and exports_prop.text
+                            and export_name.text
+                            and module_obj.text.decode("utf8") == "module"
+                            and exports_prop.text.decode("utf8") == "exports"
+                        ):
+                            function_name = export_name.text.decode("utf8")
+                            ingest_exported_function(
+                                export_function,
+                                function_name,
+                                module_qn,
+                                "CommonJS Module Export",
+                                self.ingestor,
+                                self.function_registry,
+                                self.simple_name_lookup,
+                                self._get_docstring,
+                                self._is_export_inside_function,
+                                file_path=getattr(
+                                    self._current_file_path, "value", None
+                                ),
+                                emit_node=self._emit_node,
+                                queue_registry_entry=self._queue_registry_entry,
+                                add_simple_name=self._add_simple_name,
+                            )
+
+                except Exception as e:
+                    logger.debug(f"Failed to process CommonJS exports query: {e}")
+
+        except Exception as e:
+            logger.debug(f"Failed to detect CommonJS exports: {e}")
+
+    def _ingest_es6_exports(
+        self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
+    ) -> None:
+        """Detect and ingest ES6 export statements as function definitions."""
+        try:
+            lang_query = queries[language]["language"]
+
+            # Query for export const name = function patterns
+            export_const_query = """
+            (export_statement
+              (lexical_declaration
+                (variable_declarator
+                  name: (identifier) @export_name
+                  value: [(function_expression) (arrow_function)] @export_function)))
+            """
+
+            # Query for export function name patterns
+            export_function_query = """
+            (export_statement
+              [(function_declaration) (generator_function_declaration)] @export_function)
+            """
+
+            for query_text in [export_const_query, export_function_query]:
+                try:
+                    cleaned_query = textwrap.dedent(query_text).strip()
+                    query = Query(lang_query, cleaned_query)
+                    cursor = QueryCursor(query)
+                    captures = cursor.captures(root_node)
+
+                    export_names = captures.get("export_name", [])
+                    export_functions = captures.get("export_function", [])
+
+                    # Process export const name = function patterns
+                    for export_name, export_function in zip(
+                        export_names, export_functions
+                    ):
+                        if export_name.text and export_function:
+                            function_name = export_name.text.decode("utf8")
+                            ingest_exported_function(
+                                export_function,
+                                function_name,
+                                module_qn,
+                                "ES6 Export Function",
+                                self.ingestor,
+                                self.function_registry,
+                                self.simple_name_lookup,
+                                self._get_docstring,
+                                self._is_export_inside_function,
+                                file_path=getattr(
+                                    self._current_file_path, "value", None
+                                ),
+                                emit_node=self._emit_node,
+                                queue_registry_entry=self._queue_registry_entry,
+                                add_simple_name=self._add_simple_name,
+                            )
+
+                    # Process export function patterns (function declarations)
+                    if not export_names:  # Only function declarations
+                        for export_function in export_functions:
+                            if export_function:
+                                # Get function name from the function declaration
+                                if name_node := export_function.child_by_field_name(
+                                    "name"
+                                ):
+                                    if name_node.text:
+                                        function_name = name_node.text.decode("utf8")
+                                        ingest_exported_function(
+                                            export_function,
+                                            function_name,
+                                            module_qn,
+                                            "ES6 Export Function Declaration",
+                                            self.ingestor,
+                                            self.function_registry,
+                                            self.simple_name_lookup,
+                                            self._get_docstring,
+                                            self._is_export_inside_function,
+                                            file_path=getattr(
+                                                self._current_file_path, "value", None
+                                            ),
+                                            emit_node=self._emit_node,
+                                            queue_registry_entry=self._queue_registry_entry,
+                                            add_simple_name=self._add_simple_name,
+                                        )
+
+                except Exception as e:
+                    logger.debug(f"Failed to process ES6 exports query: {e}")
+
+        except Exception as e:
+            logger.debug(f"Failed to detect ES6 exports: {e}")
+
+    def _ingest_assignment_arrow_functions(
+        self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
+    ) -> None:
+        """Detect arrow functions in assignment expressions and object literals."""
+        # Only apply to JavaScript/TypeScript
+        if language not in JS_TYPESCRIPT_LANGUAGES:
+            return
+
+        try:
+            lang_query = queries[language]["language"]
+
+            # Query for object literal arrow functions: { arrowMethod: () => {} }
+            object_arrow_query = """
+            (object
+              (pair
+                (property_identifier) @method_name
+                (arrow_function) @arrow_function))
+            """
+
+            # Query for assignment arrow functions: this.arrowProperty = () => {}
+            assignment_arrow_query = """
+            (assignment_expression
+              (member_expression) @member_expr
+              (arrow_function) @arrow_function)
+            """
+
+            # Query for assignment function expressions: this.funcProperty = function() {}
+            assignment_function_query = """
+            (assignment_expression
+              (member_expression) @member_expr
+              (function_expression) @function_expr)
+            """
+
+            for query_text in [
+                object_arrow_query,
+                assignment_arrow_query,
+                assignment_function_query,
+            ]:
+                try:
+                    query = Query(lang_query, query_text)
+                    cursor = QueryCursor(query)
+                    captures = cursor.captures(root_node)
+
+                    method_names = captures.get("method_name", [])
+                    member_exprs = captures.get("member_expr", [])
+                    arrow_functions = captures.get("arrow_function", [])
+                    function_exprs = captures.get("function_expr", [])
+
+                    # Process object literal arrow methods
+                    for method_name, arrow_function in zip(
+                        method_names, arrow_functions
+                    ):
+                        if method_name.text and arrow_function:
+                            function_name = method_name.text.decode("utf8")
+
+                            # Get language config for nested name building
+                            lang_config = queries[language].get("config")
+                            if lang_config:
+                                # Use the same nested qualified name logic as functions
+                                function_qn = self._build_nested_qualified_name(
+                                    arrow_function,
+                                    module_qn,
+                                    function_name,
+                                    lang_config,
+                                    skip_classes=False,
+                                )
+                                if function_qn is None:
+                                    function_qn = f"{module_qn}.{function_name}"
+                            else:
+                                function_qn = f"{module_qn}.{function_name}"
+
+                            function_props = {
+                                "qualified_name": function_qn,
+                                "name": function_name,
+                                "start_line": arrow_function.start_point[0] + 1,
+                                "end_line": arrow_function.end_point[0] + 1,
+                                "docstring": self._get_docstring(arrow_function),
+                                "path": getattr(self._current_file_path, "value", None),
+                            }
+
+                            logger.debug(
+                                f"  Found Object Arrow Function: {function_name} (qn: {function_qn})"
+                            )
+                            self._emit_node("Function", function_props)
+                            self._queue_registry_entry(function_qn, "Function")
+                            self._add_simple_name(function_name, function_qn)
+
+                    # Process assignment arrow functions
+                    for member_expr, arrow_function in zip(
+                        member_exprs, arrow_functions
+                    ):
+                        if member_expr.text and arrow_function:
+                            # Extract property name from this.propertyName
+                            member_text = member_expr.text.decode("utf8")
+                            if "." in member_text:
+                                function_name = member_text.split(".")[
+                                    -1
+                                ]  # Get the property name
+
+                                # Get language config for nested name building
+                                lang_config = queries[language].get("config")
+                                if lang_config:
+                                    # Use specialized logic for assignment arrow functions
+                                    function_qn = self._build_assignment_arrow_function_qualified_name(
+                                        member_expr,
+                                        arrow_function,
+                                        module_qn,
+                                        function_name,
+                                        lang_config,
+                                    )
+                                    if function_qn is None:
+                                        function_qn = f"{module_qn}.{function_name}"
+                                else:
+                                    function_qn = f"{module_qn}.{function_name}"
+
+                                function_props = {
+                                    "qualified_name": function_qn,
+                                    "name": function_name,
+                                    "start_line": arrow_function.start_point[0] + 1,
+                                    "end_line": arrow_function.end_point[0] + 1,
+                                    "docstring": self._get_docstring(arrow_function),
+                                    "path": getattr(
+                                        self._current_file_path, "value", None
+                                    ),
+                                }
+
+                                logger.debug(
+                                    f"  Found Assignment Arrow Function: {function_name} (qn: {function_qn})"
+                                )
+                                self._emit_node("Function", function_props)
+                                self._queue_registry_entry(function_qn, "Function")
+                                self._add_simple_name(function_name, function_qn)
+
+                    # Process assignment function expressions
+                    for member_expr, function_expr in zip(member_exprs, function_exprs):
+                        if member_expr.text and function_expr:
+                            # Extract property name from this.propertyName
+                            member_text = member_expr.text.decode("utf8")
+                            if "." in member_text:
+                                function_name = member_text.split(".")[
+                                    -1
+                                ]  # Get the property name
+
+                                # Get language config for nested name building
+                                lang_config = queries[language].get("config")
+                                if lang_config:
+                                    # Use specialized logic for assignment function expressions
+                                    function_qn = self._build_assignment_arrow_function_qualified_name(
+                                        member_expr,
+                                        function_expr,
+                                        module_qn,
+                                        function_name,
+                                        lang_config,
+                                    )
+                                    if function_qn is None:
+                                        function_qn = f"{module_qn}.{function_name}"
+                                else:
+                                    function_qn = f"{module_qn}.{function_name}"
+
+                                function_props = {
+                                    "qualified_name": function_qn,
+                                    "name": function_name,
+                                    "start_line": function_expr.start_point[0] + 1,
+                                    "end_line": function_expr.end_point[0] + 1,
+                                    "docstring": self._get_docstring(function_expr),
+                                    "path": getattr(
+                                        self._current_file_path, "value", None
+                                    ),
+                                }
+
+                                logger.debug(
+                                    f"  Found Assignment Function Expression: {function_name} (qn: {function_qn})"
+                                )
+                                self._emit_node("Function", function_props)
+                                self._queue_registry_entry(function_qn, "Function")
+                                self._add_simple_name(function_name, function_qn)
+
+                except Exception as e:
+                    logger.debug(
+                        f"Failed to process assignment arrow functions query: {e}"
+                    )
+
+        except Exception as e:
+            logger.debug(f"Failed to detect assignment arrow functions: {e}")
+
+    def _is_inside_method_with_object_literals(self, func_node: Node) -> bool:
+        """Check if this function is an object literal method inside a class method."""
+        # Walk up to see if we're inside an object literal inside a method_definition
+        current = func_node.parent
+        found_object = False
+
+        while current:
+            if current.type == "object":
+                found_object = True
+            elif current.type == "method_definition" and found_object:
+                # We're inside an object literal inside a method - this should be nested
+                return True
+            elif current.type == "class_body":
+                # Reached class body - stop looking
+                break
+            current = current.parent
+
+        return False
+
+    def _is_class_method(self, method_node: Node) -> bool:
+        """Check if a method definition is inside a class body."""
+        current = method_node.parent
+        while current:
+            if current.type == "class_body":
+                return True
+            elif current.type in ["program", "module"]:
+                return False
+            current = current.parent
+        return False
+
+    def _is_export_inside_function(self, export_node: Node) -> bool:
+        """Check if this export statement is inside a function body."""
+        current = export_node.parent
+        while current:
+            if current.type in [
+                "function_declaration",
+                "function_expression",
+                "arrow_function",
+                "method_definition",
+            ]:
+                return True
+            elif current.type in ["program", "module"]:
+                # Reached module level - not inside a function
+                return False
+            current = current.parent
+        return False
+
+    def _find_object_name_for_method(self, method_name_node: Node) -> str | None:
+        """Find the object variable name that contains this method, using proper tree-sitter traversal."""
+        # Walk up the tree to find the variable declarator or assignment
+        current = method_name_node.parent
+        while current:
+            if current.type == "variable_declarator":
+                # Use field-based access to get the variable name
+                name_node = current.child_by_field_name("name")
+                if name_node and name_node.type == "identifier" and name_node.text:
+                    return str(name_node.text.decode("utf8"))
+            elif current.type == "assignment_expression":
+                # Use field-based access to get assignment target
+                left_child = current.child_by_field_name("left")
+                if left_child and left_child.type == "identifier" and left_child.text:
+                    return str(left_child.text.decode("utf8"))
+            current = current.parent
+        return None
+
+    def _build_object_method_qualified_name(
+        self,
+        method_name_node: Node,
+        method_func_node: Node,
+        module_qn: str,
+        method_name: str,
+        lang_config: LanguageConfig,
+    ) -> str | None:
+        """Build proper qualified name for object literal methods using tree-sitter traversal.
+
+        Skips intermediate object variable names to get semantic nesting like:
+        - createApiClient.get (not createApiClient.client.get)
+        - ServiceFactory.createService.process (not ServiceFactory.createService.{obj}.process)
+        """
+        path_parts = []
+
+        # Start from the method name node and walk up to find the containing function/class context
+        current = method_name_node.parent
+
+        # Walk up past the object literal and variable declaration to find the containing function
+        while current and current.type not in lang_config.module_node_types:
+            # Skip these object-related nodes to get to the containing function
+            if current.type in [
+                "object",
+                "variable_declarator",
+                "variable_declaration",
+                "assignment_expression",
+                "pair",
+            ]:
+                current = current.parent
+                continue
+
+            # Handle functions (named and anonymous)
+            if current.type in lang_config.function_node_types:
+                name_node = current.child_by_field_name("name")
+                if name_node and name_node.text:
+                    path_parts.append(name_node.text.decode("utf8"))
+            # Handle classes
+            elif current.type in lang_config.class_node_types:
+                name_node = current.child_by_field_name("name")
+                if name_node and name_node.text:
+                    path_parts.append(name_node.text.decode("utf8"))
+            # Handle methods inside classes
+            elif current.type == "method_definition":
+                name_node = current.child_by_field_name("name")
+                if name_node and name_node.text:
+                    path_parts.append(name_node.text.decode("utf8"))
+
+            current = current.parent
+
+        # Reverse the path parts to get correct order (module -> class -> method -> method)
+        path_parts.reverse()
+
+        if path_parts:
+            return f"{module_qn}.{'.'.join(path_parts)}.{method_name}"
+        else:
+            return f"{module_qn}.{method_name}"
+
+    def _build_assignment_arrow_function_qualified_name(
+        self,
+        member_expr: Node,
+        arrow_function: Node,
+        module_qn: str,
+        function_name: str,
+        lang_config: LanguageConfig,
+    ) -> str | None:
+        """Build proper qualified name for arrow functions in assignments using tree-sitter traversal.
+
+        Handles cases like:
+        - this.fetchUser = () => {} in constructor
+        - this.retry = () => {} in method
+        """
+        path_parts = []
+
+        # Start from the assignment expression and walk up to find the containing context
+        current = member_expr.parent  # assignment_expression
+        if current and current.type == "assignment_expression":
+            current = current.parent  # expression_statement or other container
+
+        # Walk up to find containing functions/classes/methods
+        while current and current.type not in lang_config.module_node_types:
+            # Skip expression statements and other non-semantic nodes
+            if current.type in ["expression_statement", "statement_block"]:
+                current = current.parent
+                continue
+
+            # Handle functions (named and anonymous)
+            if current.type in lang_config.function_node_types:
+                name_node = current.child_by_field_name("name")
+                if name_node and name_node.text:
+                    path_parts.append(name_node.text.decode("utf8"))
+            # Handle classes
+            elif current.type in lang_config.class_node_types:
+                name_node = current.child_by_field_name("name")
+                if name_node and name_node.text:
+                    path_parts.append(name_node.text.decode("utf8"))
+            # Handle methods inside classes (constructor, initialize, etc.)
+            elif current.type == "method_definition":
+                name_node = current.child_by_field_name("name")
+                if name_node and name_node.text:
+                    path_parts.append(name_node.text.decode("utf8"))
+
+            current = current.parent
+
+        # Reverse the path parts to get correct order (module -> class -> method -> function)
+        path_parts.reverse()
+
+        if path_parts:
+            return f"{module_qn}.{'.'.join(path_parts)}.{function_name}"
+        else:
+            return f"{module_qn}.{function_name}"
+
+    def _extract_implemented_interfaces(
+        self, class_node: Node, module_qn: str
+    ) -> list[str]:
+        """Extract implemented interface names from a Java class definition."""
+        implemented_interfaces: list[str] = []
+
+        # Look for interfaces field in Java class declaration
+        interfaces_node = class_node.child_by_field_name("interfaces")
+        if interfaces_node:
+            # The interfaces node contains a super_interfaces structure
+            # which has a type_list with comma-separated interface types
+            self._extract_java_interface_names(
+                interfaces_node, implemented_interfaces, module_qn
+            )
+
+        return implemented_interfaces
+
+    def _extract_java_interface_names(
+        self, interfaces_node: Node, interface_list: list[str], module_qn: str
+    ) -> None:
+        """Extract interface names from Java interfaces clause using tree-sitter."""
+        for child in interfaces_node.children:
+            if child.type == "type_list":
+                # Type list contains the actual interface types
+                for type_child in child.children:
+                    if type_child.type == "type_identifier":
+                        interface_name = type_child.text
+                        if interface_name:
+                            interface_name_str = interface_name.decode("utf8")
+                            # Resolve to fully qualified name
+                            resolved_interface = (
+                                self._resolve_class_name(interface_name_str, module_qn)
+                                or f"{module_qn}.{interface_name_str}"
+                            )
+                            interface_list.append(resolved_interface)
+
+    def _create_implements_relationship(
+        self, class_type: str, class_qn: str, interface_qn: str
+    ) -> None:
+        """Create an IMPLEMENTS relationship between a class and an interface."""
+        self._emit_rel(
+            (class_type, "qualified_name", class_qn),
+            "IMPLEMENTS",
+            ("Interface", "qualified_name", interface_qn),
+        )
+
+    def _ingest_pybind11_bindings(
+        self, root_node: Node, module_qn: str, language: str, queries: dict[str, Any]
+    ) -> None:
+        """Ingest Pybind11 module definitions and bindings."""
+        # Get the language object for creating queries
+        lang_queries = queries[language]
+        language_obj = lang_queries.get("language")
+        if not language_obj:
+            return
+
+        try:
+            # Query to find PYBIND11_MODULE definition
+            module_query = Query(
+                language_obj,
+                """
+                (function_definition
+                    declarator: (function_declarator
+                        declarator: (identifier) @macro_name
+                        parameters: (parameter_list
+                            (parameter_declaration
+                                type: (type_identifier) @module_name
+                            )
+                            (parameter_declaration
+                                type: (type_identifier) @module_var
+                            )
+                        )
+                    )
+                    (#eq? @macro_name "PYBIND11_MODULE")
+                ) @module_def
+            """,
+            )
+
+            cursor = QueryCursor(module_query)
+            module_captures = cursor.captures(root_node)
+
+            for capture in module_captures.get("module_def", []):
+                # Extract module name
+                module_name_node = (
+                    capture.child_by_field_name("declarator")
+                    .child_by_field_name("parameters")
+                    .children[1]
+                    .child_by_field_name("type")
+                )
+
+                py_module_name = module_name_node.text.decode("utf-8")
+
+                # Determine qualified name
+                if py_module_name == "TORCH_EXTENSION_NAME":
+                    # Fallback: Use C++ file's fully qualified name suffixed with .<binding>
+                    py_module_qn = f"{module_qn}.<binding>"
+                else:
+                    # Standard case
+                    if not py_module_name.startswith(self.project_name):
+                        py_module_qn = f"{self.project_name}.{py_module_name}"
+                    else:
+                        py_module_qn = py_module_name
+
+                logger.debug(
+                    f"  Found Pybind11 Module: {py_module_name} (qn: {py_module_qn})"
+                )
+
+                # Create Python File Node for the Pybind11 module
+                # Use a virtual path to avoid conflict with the C++ source file
+                cpp_file_path = str(
+                    self.module_qn_to_file_path[module_qn].relative_to(self.repo_path)
+                )
+                self._emit_node(
+                    "File",
+                    {
+                        "qualified_name": py_module_qn,
+                        "name": py_module_name
+                        if py_module_name != "TORCH_EXTENSION_NAME"
+                        else "<binding>",
+                        "path": f"<pybind11>/{py_module_qn}",  # Virtual path for Python binding
+                        "cpp_source": cpp_file_path,  # Reference to actual C++ source
+                        "language": "python",
+                        "is_extension": True,
+                    },
+                )
+
+                # 2. Search for bindings inside the module definition body
+                body_node = capture.child_by_field_name("body")
+                self._process_pybind11_bindings(
+                    body_node, py_module_qn, module_qn, language_obj
+                )
+
+        except Exception as e:
+            logger.warning(f"Failed to ingest Pybind11 bindings: {e}")
+
+    def _process_pybind11_bindings(
+        self, body_node: Node, py_module_qn: str, cpp_module_qn: str, language_obj: Any
+    ) -> None:
+        # Query to find m.def() calls inside the module definition
+        def_query = Query(
+            language_obj,
+            """
+            (call_expression
+                function: (field_expression
+                    field: (field_identifier) @method_name
+                ) @field_expr
+                arguments: (argument_list) @args
+                (#eq? @method_name "def")
+            ) @def_call
+        """,
+        )
+
+        cursor = QueryCursor(def_query)
+        def_captures = cursor.captures(body_node)
+
+        for call_node in def_captures.get("def_call", []):
+            args_node = call_node.child_by_field_name("arguments")
+            if not args_node:
+                continue
+
+            # Filter out punctuation (parentheses, commas) to get actual arguments
+            args = [
+                child
+                for child in args_node.children
+                if child.type not in ("(", ")", ",")
+            ]
+
+            if len(args) >= 2:
+                # Arg 0: Python Name (String Literal)
+                py_name_node = args[0]
+                if py_name_node.type == "string_literal":
+                    py_func_name = py_name_node.text.decode("utf-8").strip('"')
+                    py_func_qn = f"{py_module_qn}.{py_func_name}"
+
+                    # Arg 1: C++ Target
+                    cpp_target_node = args[1]
+                    cpp_target_name = self._extract_cpp_target(cpp_target_node)
+
+                    # Extract simple name for lookup (handle namespaces)
+                    simple_target_name = cpp_target_name.split("::")[-1]
+
+                    # Create Python Function Node
+                    self._emit_node(
+                        "Function",
+                        {
+                            "qualified_name": py_func_qn,
+                            "name": py_func_name,
+                            "language": "python",
+                            "is_binding": True,
+                            "cpp_target": cpp_target_name,
+                        },
+                    )
+
+                    # Register in function registry so it can be resolved by imports
+                    self._queue_registry_entry(py_func_qn, "Function")
+                    self._add_simple_name(py_func_name, py_func_qn)
+
+                    # Link File -> Function
+                    self._emit_rel(
+                        ("File", "qualified_name", py_module_qn),
+                        "DEFINES",
+                        ("Function", "qualified_name", py_func_qn),
+                    )
+
+                    logger.debug(
+                        f"    Pybind11 Binding: {py_func_name} -> {cpp_target_name}"
+                    )
+
+                    candidates = self.simple_name_lookup.get(simple_target_name, set())
+                    if candidates:
+                        # Filter candidates: prioritize definitions (with bodies) over declarations
+                        # Use lock to safely access cpp_definitions and create snapshot of candidates
+                        with self._cpp_definitions_lock:
+                            cpp_defs_snapshot = set(self.cpp_definitions)
+                        # Create a list snapshot to avoid concurrent modification issues during iteration
+                        candidates_snapshot = list(candidates)
+                        def_candidates = [
+                            c for c in candidates_snapshot if c in cpp_defs_snapshot
+                        ]
+
+                        # If we found definitions, only link to them. Otherwise fallback to all candidates.
+                        # This avoids linking to header declarations when implementation is available.
+                        targets = def_candidates if def_candidates else candidates
+
+                        if def_candidates:
+                            logger.debug(
+                                f"    Prioritizing {len(def_candidates)} definitions for {simple_target_name}"
+                            )
+
+                        for cand_qn in targets:
+                            # Avoid self-binding and binding to other Python nodes
+                            if cand_qn == py_func_qn:
+                                continue
+
+                            # Heuristic: Prefer C++ nodes or at least don't bind if it's obviously unrelated
+                            # For now, bind to all candidates sharing the simple name.
+                            # Since we stripped namespace, we rely on simple name collision not being too high
+                            self._emit_rel(
+                                ("Function", "qualified_name", py_func_qn),
+                                "BINDS_TO",
+                                ("Function", "qualified_name", cand_qn),
+                            )
+
+    def _extract_cpp_target(self, node: Node) -> str:
+        """Extract readable C++ target name from expression."""
+        if node.type == "pointer_expression":
+            # &func -> func
+            arg = node.child_by_field_name("argument")
+            return arg.text.decode("utf-8") if arg else ""
+        elif node.type == "identifier":
+            return node.text.decode("utf-8")
+        elif node.type == "lambda_expression":
+            return "<lambda>"
+        else:
+            # Fallback
+            return node.text.decode("utf-8")

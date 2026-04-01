@@ -1,0 +1,72 @@
+# Local environment and tooling
+.env
+.env.local
+.env.*.local
+!.env.example
+.mcp.json
+.claude/
+.claude-sdk/
+.atcode/
+.codex
+# Runtime data and local state
+data/
+memgraph_data/
+memgraph_backup/
+bin/
+.run/
+backend/task_store/
+backend/api/task_store/
+backend/operator_eval_results/
+backend/agent/agent_optimize_status.json
+backend/agent/agent_optimization_memory.md
+
+# Frontend build output
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/*.tsbuildinfo
+frontend/next-env.d.ts
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+ENV/
+
+# Build and coverage artifacts
+build/
+dist/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+logs/
+
+# Temporary, editor, and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+.nfs*
+.tmp/
+*.tmp
+*.bak
+*.bak2
+.ipynb_checkpoints/
+
+# Internal-only local automation artifacts
+scripts_local/
+
+# Legacy root-level outputs from older versions
+wiki_doc/
+wiki_repos/
+wiki_embedding/

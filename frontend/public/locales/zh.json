@@ -1,0 +1,334 @@
+{
+  "common": {
+    "loading": "加载中...",
+    "error": "错误",
+    "success": "成功",
+    "cancel": "取消",
+    "confirm": "确认",
+    "save": "保存",
+    "delete": "删除",
+    "edit": "编辑",
+    "add": "添加",
+    "search": "搜索",
+    "close": "关闭",
+    "back": "返回",
+    "next": "下一步",
+    "previous": "上一步",
+    "yes": "是",
+    "no": "否",
+    "or": "或",
+    "and": "和",
+    "optional": "可选"
+  },
+  "nav": {
+    "home": "首页",
+    "repositories": "仓库",
+    "documentation": "文档",
+    "settings": "设置"
+  },
+  "repos": {
+    "title": "代码仓库",
+    "subtitle": "选择要理解的代码仓库",
+    "addDescription": "添加 Git 仓库，自动生成文档和知识图谱",
+    "searchPlaceholder": "搜索仓库...",
+    "addRepo": "添加仓库",
+    "noRepos": "没有找到仓库",
+    "noReposMatching": "没有找到匹配 \"{query}\" 的仓库",
+    "knowledgeGraph": "知识图谱",
+    "nodes": "节点",
+    "edges": "边",
+    "branch": "分支",
+    "branchPlaceholder": "main, master, develop 等（留空使用默认分支）",
+    "branchOptional": "分支（可选）",
+    "privateRepo": "私有仓库（需要认证）",
+    "privateRepoHint": "对于私有仓库，请提供 Git 用户名和密码/访问令牌。",
+    "username": "用户名",
+    "usernamePlaceholder": "Git 用户名",
+    "password": "密码/令牌",
+    "passwordPlaceholder": "密码或访问令牌",
+    "tokenHint": "对于 GitHub/GitLab，推荐使用 Personal Access Token",
+    "repoUrl": "仓库 URL",
+    "repoUrlPlaceholder": "https://github.com/user/repo.git",
+    "adding": "添加中...",
+    "actions": {
+      "viewDocs": "查看文档",
+      "chat": "对话",
+      "refreshGraph": "刷新图谱",
+      "buildGraph": "构建图谱",
+      "cleanGraph": "清理图谱",
+      "regenerate": "重新生成",
+      "delete": "删除"
+    },
+    "status": {
+      "building": "构建中...",
+      "cleaning": "清理中...",
+      "ready": "就绪",
+      "error": "错误"
+    },
+    "confirmDelete": {
+      "title": "确认删除仓库",
+      "message": "确定要删除仓库 {name} 吗？",
+      "warning": "此操作将删除以下内容且无法撤销：",
+      "items": {
+        "docs": "所有研究文档",
+        "localCopy": "本地仓库副本",
+        "chatHistory": "对话记录",
+        "graphData": "知识图谱数据"
+      },
+      "deleting": "删除中..."
+    },
+    "confirmRegenerate": {
+      "title": "重新生成仓库文档",
+      "message": "确定要重新生成仓库 {name} 的文档吗？",
+      "description": "这将重新构建知识图谱并更新所有研究文档。",
+      "regenerating": "重新生成中..."
+    },
+    "confirmCleanGraph": {
+      "title": "确认清理知识图谱",
+      "message": "确定要清理项目 {name} 的知识图谱吗？",
+      "warning": "此操作将删除该项目的所有图谱节点和边，无法撤销。"
+    },
+    "confirmRefreshGraph": {
+      "title": "确认刷新知识图谱",
+      "titleBuild": "确认生成知识图谱",
+      "messageRefresh": "确定要刷新项目 {name} 的知识图谱吗？",
+      "messageBuild": "确定要为项目 {name} 生成知识图谱吗？",
+      "descriptionRefresh": "这将重新解析代码仓库并重建知识图谱，包括语义嵌入。",
+      "descriptionBuild": "这将解析代码仓库并构建知识图谱，包括语义嵌入。",
+      "gpuHint": "系统将使用 GPU 批量处理加速嵌入生成，大型仓库可能需要几分钟时间。",
+      "fastMode": "快速模式",
+      "fastModeHint": "跳过嵌入生成（更快，但无法使用语义搜索）",
+      "refresh": "刷新",
+      "build": "生成",
+      "building": "生成中..."
+    },
+    "toast": {
+      "loadFailed": "加载仓库列表失败",
+      "addFailed": "添加仓库失败",
+      "addStarted": "仓库 {name} 已开始添加，可通过右下角任务面板查看进���",
+      "deleteFailed": "删除失败",
+      "deleteSuccess": "仓库已完全删除（包括文档和知识图谱）",
+      "regenerateFailed": "重新生成失败",
+      "regenerateStarted": "开始重新生成 {name} 文档，可通过右下角任务面板查看进度",
+      "cleanFailed": "清理知识图谱失败",
+      "cleanSuccess": "已清理 {name} 的知识图谱，删除了 {count} 个节点",
+      "graphBuildComplete": "{name} 知识图谱构建完成",
+      "graphBuildFailed": "{name} 知识图谱构建失败: {error}",
+      "graphBuildTimeout": "{name} 知识图谱构建时间较长，请稍后手动刷新查看结果",
+      "graphStarted": "开始{action} {name} 的知识图谱{mode}",
+      "operationFailed": "操作失败",
+      "enterRepoUrl": "请输入仓库 URL"
+    }
+  },
+  "chat": {
+    "title": "对话",
+    "placeholder": "询问关于代码的问题...",
+    "send": "发送",
+    "newChat": "新对话",
+    "history": "对话历史",
+    "noHistory": "暂无对话历史",
+    "clearHistory": "清除历史",
+    "thinking": "思考中...",
+    "tools": {
+      "searchCode": "搜索代码中...",
+      "queryGraph": "查询图谱中...",
+      "readFile": "读取文件中..."
+    },
+    "context": {
+      "document": "文档上下文",
+      "selection": "选中文本"
+    },
+    "modes": {
+      "default": "默认",
+      "research": "研究",
+      "operator": "算子分析"
+    },
+    "templates": {
+      "operator": {
+        "name": "算子分析",
+        "description": "深度分析特定算子/函数的实现和依赖",
+        "template": "分析 [在此输入算子名称] 的完整实现：\n- 函数签名和参数说明\n- 依赖关系和调用链\n- 底层实现（Triton/CUDA/C++ 内核）\n- 性能优化策略\n- 使用示例"
+      },
+      "research": {
+        "name": "深度研究",
+        "description": "对某个领域/主题进行全面深度研究",
+        "template": "深度研究 [在此输入研究主题]：\n- 核心概念和设计理念\n- 架构设计和组件关系\n- 关键实现细节\n- 数据流和调用链\n- 最佳实践和使用模式"
+      },
+      "architecture": {
+        "name": "架构分析",
+        "description": "分析系统/模块的架构设计和设计模式",
+        "template": "分析 [在此输入模块/系统名称] 的架构设计：\n- 整体架构和分层结构\n- 核心组件和职责划分\n- 组件间通信和数据流\n- 使用的设计模式\n- 扩展点和接口设计"
+      },
+      "custom": {
+        "name": "自定义",
+        "description": "自由输入研究需求",
+        "template": "[在此输入你的研究需求]"
+      }
+    }
+  },
+  "docs": {
+    "title": "文档",
+    "overview": "概览",
+    "sections": "章节",
+    "codeBlocks": "代码块",
+    "noCodeBlocks": "暂无代码块",
+    "references": "引用",
+    "relatedDocs": "相关文档",
+    "lastUpdated": "最后更新",
+    "generatedBy": "由 AtCode 生成"
+  },
+  "code": {
+    "viewer": "代码查看器",
+    "copyCode": "复制代码",
+    "copied": "已复制！",
+    "expand": "展开",
+    "collapse": "收起",
+    "lines": "{count} 行",
+    "file": "文件"
+  },
+  "graph": {
+    "title": "知识图谱",
+    "nodes": "节点",
+    "edges": "边",
+    "projects": "项目",
+    "refresh": "刷新",
+    "clean": "清理",
+    "stats": "统计"
+  },
+  "tasks": {
+    "title": "任务",
+    "active": "活动任务",
+    "completed": "已完成",
+    "failed": "失败",
+    "pending": "等待中",
+    "running": "运行中",
+    "cancel": "取消任务",
+    "noTasks": "暂无活动任务",
+    "progress": "进度"
+  },
+  "settings": {
+    "title": "设置",
+    "language": "语言",
+    "theme": "主题",
+    "themes": {
+      "light": "浅色",
+      "dark": "深色",
+      "system": "跟随系统"
+    }
+  },
+  "errors": {
+    "notFound": "页面未找到",
+    "serverError": "服务器错误",
+    "networkError": "网络错误",
+    "unauthorized": "未授权",
+    "forbidden": "禁止访问",
+    "unknown": "发生未知错误"
+  },
+  "dropdown": {
+    "regenerateDocs": "重新生成文档",
+    "regenerateDocsDesc": "重新生成 operators 文档",
+    "moveToFolder": "移到文件夹",
+    "moveToFolderDesc": "将文档整理到其他文件夹",
+    "syncSettings": "同步 & Git",
+    "syncSettingsDesc": "文件监控、分支切换",
+    "queuedGraph": "图谱排队中...",
+    "generatingGraph": "正在生成图谱...",
+    "cleaningGraph": "正在清理图谱...",
+    "refreshGraph": "刷新知识图谱",
+    "buildGraph": "生成知识图谱",
+    "waitingInQueue": "已进入队列，等待开始构建...",
+    "parsingCode": "请稍候，正在解析代码...",
+    "cleaningData": "请稍候，正在清理数据...",
+    "refreshGraphDesc": "重新解析代码并更新图谱",
+    "buildGraphDesc": "解析代码并生成图谱",
+    "deleteDoc": "删除文档",
+    "deleteRepo": "删除仓库",
+    "deleteFolder": "删除文件夹",
+    "deleteDocDesc": "删除 Operator 文档",
+    "deleteRepoDesc": "删除仓库、文档及知识图谱",
+    "deleteFolderDesc": "文档将移到根目录"
+  },
+  "empty": {
+    "noData": "暂无数据",
+    "startProject": "开始创建你的第一个项目吧",
+    "startChat": "开始对话",
+    "chatDesc": "提问关于代码库的任何问题，获取智能解答和代码引用",
+    "codeReferences": "代码引用将显示在这里",
+    "codeReferencesDesc": "点击文档中的代码链接，右侧将自动显示对应的代码片段",
+    "noRepos": "还没有仓库",
+    "noReposDesc": "添加你的第一个代码仓库，开始生成智能文档",
+    "addRepo": "添加仓库"
+  },
+  "card": {
+    "queuedGraph": "图谱排队中",
+    "generatingGraph": "生成图谱中",
+    "cleaningGraph": "清理图谱中",
+    "researchDocs": "研究文档",
+    "nodes": "节点",
+    "edges": "边",
+    "graphReady": "图谱就绪",
+    "pendingGraph": "待生成图谱",
+    "pending": "等待中",
+    "running": "生成中",
+    "completed": "已完成",
+    "failed": "失败",
+    "initializing": "初始化中...",
+    "progress": "进度",
+    "syncEnabled": "同步中"
+  },
+  "overview": {
+    "generateDoc": "生成文档",
+    "generateDocDesc": "基于知识图谱自动生成结构化文档",
+    "configuration": "配置",
+    "language": "语言",
+    "chinese": "中文",
+    "mode": "模式",
+    "modeOverview": "概览",
+    "modeDetailed": "详细",
+    "overviewDesc": "架构聚焦 · 1-3 分钟",
+    "detailedDesc": "包含实现细节 · 5-10 分钟",
+    "depth": "深度",
+    "focus": "侧重点",
+    "optional": "可选",
+    "focusPlaceholder": "API 设计、性能优化、错误处理...",
+    "generate": "生成",
+    "estimatedTime": "约 2-5 分钟",
+    "regenerate": "重新生成",
+    "regenerateDesc": "创建新版本，现有版本保留",
+    "cancel": "取消",
+    "generating": "生成中",
+    "initializing": "初始化",
+    "modules": "模块文档",
+    "packages": "包文档",
+    "finalizing": "完成中",
+    "versions": "版本",
+    "available": "个版本",
+    "default": "默认",
+    "viewing": "当前",
+    "deleteConfirm": "删除？",
+    "no": "取消",
+    "yes": "是",
+    "view": "查看",
+    "setDefault": "设为默认",
+    "delete": "删除",
+    "done": "完成",
+    "versionManager": "版本管理",
+    "showToc": "显示目录",
+    "tableOfContents": "目录"
+  },
+  "mermaid": {
+    "zoomActive": "缩放激活 • 滚动缩放 • 拖拽平移",
+    "hoverToZoom": "悬停激活缩放 • 拖拽平移 • 双击全屏"
+  },
+  "wiki": {
+    "diagramLoading": "流程图将在生成完成后显示..."
+  },
+  "folder": {
+    "createTitle": "创建新文件夹",
+    "createIn": "在 \"{name}\" 中创建",
+    "namePlaceholder": "输入文件夹名称",
+    "create": "创建",
+    "errorEmpty": "文件夹名称不能为空",
+    "errorTooLong": "文件夹名称不能超过100个字符"
+  }
+}

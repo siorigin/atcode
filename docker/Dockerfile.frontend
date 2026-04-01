@@ -1,0 +1,43 @@
+# AtCode Frontend — Docker image (multi-stage)
+# Built from frontend context: docker build -f docker/Dockerfile.frontend frontend
+
+# ── Stage 1: Install deps & build ────────────────────────────────────────────
+FROM node:20-alpine AS builder
+
+WORKDIR /app/frontend
+
+# Accept build-time API_PORT so Next.js can inline NEXT_PUBLIC_* at build time
+ARG API_PORT=8008
+ENV API_PORT=${API_PORT}
+ENV NEXT_PUBLIC_API_PORT=${API_PORT}
+
+# Copy package files first (layer cache)
+COPY package.json package-lock.json* ./
+RUN npm ci
+
+# Copy remaining frontend source. Runtime-only secrets still come from env_file
+# in compose; they do not need to be present in the build context.
+COPY . ./
+
+RUN npm run build
+
+# ── Stage 2: Minimal runtime ─────────────────────────────────────────────────
+FROM node:20-alpine AS runner
+
+WORKDIR /app/frontend
+
+ENV NODE_ENV=production
+ENV HOSTNAME="0.0.0.0"
+ENV PORT=3000
+
+# Copy standalone output
+COPY --from=builder /app/frontend/.next/standalone/frontend ./
+COPY --from=builder /app/frontend/.next/static ./.next/static
+COPY --from=builder /app/frontend/public ./public
+
+# WebSocket proxy wrapper (see start.js for details)
+COPY --from=builder /app/frontend/start.js ./
+
+EXPOSE 3000
+
+CMD ["node", "start.js"]

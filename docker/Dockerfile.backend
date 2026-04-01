@@ -1,0 +1,50 @@
+# AtCode Backend — Docker image
+# Built from project root:  docker build -f docker/Dockerfile.backend .
+
+FROM python:3.12-slim AS builder
+
+# Build tools needed by pymgclient (libmgclient) and tree-sitter
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake libssl-dev git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install uv for fast dependency resolution
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# Copy dependency files first (layer cache)
+COPY pyproject.toml uv.lock ./
+
+# Install Python dependencies (no semantic extras — too heavy for container)
+RUN uv sync --frozen --no-dev --no-install-project \
+        --extra production --extra mcp --extra paper \
+        --extra treesitter-full --extra fastapi --extra redis
+
+# ── Runtime stage ─────────────────────────────────────────────────────────────
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libssl3 git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy virtual env from builder
+COPY --from=builder /app/.venv /app/.venv
+ENV PATH="/app/.venv/bin:$PATH"
+
+# Copy backend source
+COPY backend/ ./backend/
+COPY pyproject.toml ./
+
+# Data directory (can be mounted as volume)
+RUN mkdir -p /app/data
+
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8008
+
+# Default: single worker; MCP tools use loopback HTTP but uvicorn's async I/O
+# keeps things responsive. For heavy MCP load, increase via --workers or env.
+CMD ["python", "-m", "api.run", "--host", "0.0.0.0", "--port", "8008", "--workers", "1"]
+WORKDIR /app/backend

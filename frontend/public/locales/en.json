@@ -1,0 +1,334 @@
+{
+  "common": {
+    "loading": "Loading...",
+    "error": "Error",
+    "success": "Success",
+    "cancel": "Cancel",
+    "confirm": "Confirm",
+    "save": "Save",
+    "delete": "Delete",
+    "edit": "Edit",
+    "add": "Add",
+    "search": "Search",
+    "close": "Close",
+    "back": "Back",
+    "next": "Next",
+    "previous": "Previous",
+    "yes": "Yes",
+    "no": "No",
+    "or": "or",
+    "and": "and",
+    "optional": "optional"
+  },
+  "nav": {
+    "home": "Home",
+    "repositories": "Repositories",
+    "documentation": "Documentation",
+    "settings": "Settings"
+  },
+  "repos": {
+    "title": "Repositories",
+    "subtitle": "Select a code repository to explore",
+    "addDescription": "Add a Git repository to automatically generate documentation and knowledge graph",
+    "searchPlaceholder": "Search repositories...",
+    "addRepo": "Add Repository",
+    "noRepos": "No repositories found",
+    "noReposMatching": "No repositories found matching \"{query}\"",
+    "knowledgeGraph": "Knowledge Graph",
+    "nodes": "nodes",
+    "edges": "edges",
+    "branch": "Branch",
+    "branchPlaceholder": "main, master, develop, etc. (leave empty for default branch)",
+    "branchOptional": "Branch (optional)",
+    "privateRepo": "Private Repository (requires authentication)",
+    "privateRepoHint": "For private repositories, please provide Git username and password/access token.",
+    "username": "Username",
+    "usernamePlaceholder": "Git username",
+    "password": "Password/Token",
+    "passwordPlaceholder": "Password or access token",
+    "tokenHint": "For GitHub/GitLab, we recommend using Personal Access Token",
+    "repoUrl": "Repository URL",
+    "repoUrlPlaceholder": "https://github.com/user/repo.git",
+    "adding": "Adding...",
+    "actions": {
+      "viewDocs": "View Documentation",
+      "chat": "Chat",
+      "refreshGraph": "Refresh Graph",
+      "buildGraph": "Build Graph",
+      "cleanGraph": "Clean Graph",
+      "regenerate": "Regenerate",
+      "delete": "Delete"
+    },
+    "status": {
+      "building": "Building...",
+      "cleaning": "Cleaning...",
+      "ready": "Ready",
+      "error": "Error"
+    },
+    "confirmDelete": {
+      "title": "Confirm Delete Repository",
+      "message": "Are you sure you want to delete repository {name}?",
+      "warning": "This action will delete the following and cannot be undone:",
+      "items": {
+        "docs": "All research documentation",
+        "localCopy": "Local repository copy",
+        "chatHistory": "Chat history",
+        "graphData": "Knowledge graph data"
+      },
+      "deleting": "Deleting..."
+    },
+    "confirmRegenerate": {
+      "title": "Regenerate Repository Documentation",
+      "message": "Are you sure you want to regenerate documentation for repository {name}?",
+      "description": "This will rebuild the knowledge graph and update all research documentation.",
+      "regenerating": "Regenerating..."
+    },
+    "confirmCleanGraph": {
+      "title": "Confirm Clean Knowledge Graph",
+      "message": "Are you sure you want to clean the knowledge graph for project {name}?",
+      "warning": "This action will delete all graph nodes and edges for this project and cannot be undone."
+    },
+    "confirmRefreshGraph": {
+      "title": "Confirm Refresh Knowledge Graph",
+      "titleBuild": "Confirm Build Knowledge Graph",
+      "messageRefresh": "Are you sure you want to refresh the knowledge graph for project {name}?",
+      "messageBuild": "Are you sure you want to build the knowledge graph for project {name}?",
+      "descriptionRefresh": "This will re-parse the code repository and rebuild the knowledge graph, including semantic embeddings.",
+      "descriptionBuild": "This will parse the code repository and build the knowledge graph, including semantic embeddings.",
+      "gpuHint": "The system will use GPU batch processing to accelerate embedding generation. Large repositories may take several minutes.",
+      "fastMode": "Fast Mode",
+      "fastModeHint": "Skip embedding generation (faster, but no semantic search)",
+      "refresh": "Refresh",
+      "build": "Build",
+      "building": "Building..."
+    },
+    "toast": {
+      "loadFailed": "Failed to load repository list",
+      "addFailed": "Failed to add repository",
+      "addStarted": "Repository {name} has started adding, check progress in task panel",
+      "deleteFailed": "Failed to delete",
+      "deleteSuccess": "Repository completely deleted (including documentation and knowledge graph)",
+      "regenerateFailed": "Failed to regenerate",
+      "regenerateStarted": "Started regenerating {name} documentation, check progress in task panel",
+      "cleanFailed": "Failed to clean knowledge graph",
+      "cleanSuccess": "Cleaned knowledge graph for {name}, deleted {count} nodes",
+      "graphBuildComplete": "{name} knowledge graph build complete",
+      "graphBuildFailed": "{name} knowledge graph build failed: {error}",
+      "graphBuildTimeout": "{name} knowledge graph build is taking longer, please refresh manually later",
+      "graphStarted": "Started {action} knowledge graph for {name}{mode}",
+      "operationFailed": "Operation failed",
+      "enterRepoUrl": "Please enter repository URL"
+    }
+  },
+  "chat": {
+    "title": "Chat",
+    "placeholder": "Ask a question about the code...",
+    "send": "Send",
+    "newChat": "New Chat",
+    "history": "Chat History",
+    "noHistory": "No chat history",
+    "clearHistory": "Clear History",
+    "thinking": "Thinking...",
+    "tools": {
+      "searchCode": "Searching code...",
+      "queryGraph": "Querying graph...",
+      "readFile": "Reading file..."
+    },
+    "context": {
+      "document": "Document Context",
+      "selection": "Selected Text"
+    },
+    "modes": {
+      "default": "Default",
+      "research": "Research",
+      "operator": "Operator Analysis"
+    },
+    "templates": {
+      "operator": {
+        "name": "Operator Analysis",
+        "description": "Deep analysis of specific operator/function implementation and dependencies",
+        "template": "Analyze the complete implementation of [enter operator name here]:\n- Function signature and parameters\n- Dependencies and call chains\n- Low-level implementation (Triton/CUDA/C++ kernels)\n- Performance optimization strategies\n- Usage examples"
+      },
+      "research": {
+        "name": "Deep Research",
+        "description": "Comprehensive deep research on a topic/area",
+        "template": "Deep research on [enter topic here]:\n- Core concepts and design philosophy\n- Architecture and component relationships\n- Key implementation details\n- Data flow and call chains\n- Best practices and usage patterns"
+      },
+      "architecture": {
+        "name": "Architecture Analysis",
+        "description": "Analyze system/module architecture design and patterns",
+        "template": "Analyze the architecture of [enter module/system name here]:\n- Overall architecture and layering\n- Core components and responsibilities\n- Inter-component communication and data flow\n- Design patterns used\n- Extension points and interface design"
+      },
+      "custom": {
+        "name": "Custom",
+        "description": "Free-form research requirements",
+        "template": "[Enter your research requirements here]"
+      }
+    }
+  },
+  "docs": {
+    "title": "Documentation",
+    "overview": "Overview",
+    "sections": "Sections",
+    "codeBlocks": "Code Blocks",
+    "noCodeBlocks": "No code blocks",
+    "references": "References",
+    "relatedDocs": "Related Documentation",
+    "lastUpdated": "Last Updated",
+    "generatedBy": "Generated by AtCode"
+  },
+  "code": {
+    "viewer": "Code Viewer",
+    "copyCode": "Copy Code",
+    "copied": "Copied!",
+    "expand": "Expand",
+    "collapse": "Collapse",
+    "lines": "{count} lines",
+    "file": "File"
+  },
+  "graph": {
+    "title": "Knowledge Graph",
+    "nodes": "Nodes",
+    "edges": "Edges",
+    "projects": "Projects",
+    "refresh": "Refresh",
+    "clean": "Clean",
+    "stats": "Statistics"
+  },
+  "tasks": {
+    "title": "Tasks",
+    "active": "Active Tasks",
+    "completed": "Completed",
+    "failed": "Failed",
+    "pending": "Pending",
+    "running": "Running",
+    "cancel": "Cancel Task",
+    "noTasks": "No active tasks",
+    "progress": "Progress"
+  },
+  "settings": {
+    "title": "Settings",
+    "language": "Language",
+    "theme": "Theme",
+    "themes": {
+      "light": "Light",
+      "dark": "Dark",
+      "system": "System"
+    }
+  },
+  "errors": {
+    "notFound": "Page not found",
+    "serverError": "Server error",
+    "networkError": "Network error",
+    "unauthorized": "Unauthorized",
+    "forbidden": "Access forbidden",
+    "unknown": "An unknown error occurred"
+  },
+  "dropdown": {
+    "regenerateDocs": "Regenerate Documentation",
+    "regenerateDocsDesc": "Regenerate operators documentation",
+    "moveToFolder": "Move to Folder",
+    "moveToFolderDesc": "Organize in a different folder",
+    "syncSettings": "Sync & Git",
+    "syncSettingsDesc": "File watching, branch switching",
+    "queuedGraph": "Graph queued...",
+    "generatingGraph": "Generating graph...",
+    "cleaningGraph": "Cleaning graph...",
+    "refreshGraph": "Refresh Knowledge Graph",
+    "buildGraph": "Build Knowledge Graph",
+    "waitingInQueue": "Queued and waiting for the build slot...",
+    "parsingCode": "Please wait, parsing code...",
+    "cleaningData": "Please wait, cleaning data...",
+    "refreshGraphDesc": "Re-parse code and update graph",
+    "buildGraphDesc": "Parse code and build graph",
+    "deleteDoc": "Delete Documentation",
+    "deleteRepo": "Delete Repository",
+    "deleteFolder": "Delete Folder",
+    "deleteDocDesc": "Delete Operator documentation",
+    "deleteRepoDesc": "Delete repository, docs and graph",
+    "deleteFolderDesc": "Documents will be moved to root"
+  },
+  "empty": {
+    "noData": "No Data",
+    "startProject": "Start creating your first project",
+    "startChat": "Start a Conversation",
+    "chatDesc": "Ask any questions about the codebase and get intelligent answers with code references",
+    "codeReferences": "Code references will appear here",
+    "codeReferencesDesc": "Click on code links in the documentation to view the corresponding code snippets",
+    "noRepos": "No Repositories Yet",
+    "noReposDesc": "Add your first code repository to start generating smart documentation",
+    "addRepo": "Add Repository"
+  },
+  "card": {
+    "queuedGraph": "Graph queued",
+    "generatingGraph": "Generating graph",
+    "cleaningGraph": "Cleaning graph",
+    "researchDocs": "research docs",
+    "nodes": "nodes",
+    "edges": "edges",
+    "graphReady": "Graph ready",
+    "pendingGraph": "Pending graph",
+    "pending": "Pending",
+    "running": "Running",
+    "completed": "Completed",
+    "failed": "Failed",
+    "initializing": "Initializing...",
+    "progress": "Progress",
+    "syncEnabled": "Sync"
+  },
+  "overview": {
+    "generateDoc": "Generate Documentation",
+    "generateDocDesc": "Automatically generate structured documentation based on knowledge graph",
+    "configuration": "Configuration",
+    "language": "Language",
+    "chinese": "Chinese",
+    "mode": "Mode",
+    "modeOverview": "Overview",
+    "modeDetailed": "Detailed",
+    "overviewDesc": "Architecture focused · 1-3 minutes",
+    "detailedDesc": "Includes implementation details · 5-10 minutes",
+    "depth": "Depth",
+    "focus": "Focus",
+    "optional": "optional",
+    "focusPlaceholder": "API design, performance optimization, error handling...",
+    "generate": "Generate",
+    "estimatedTime": "~2-5 minutes",
+    "regenerate": "Regenerate",
+    "regenerateDesc": "Create new version, existing versions preserved",
+    "cancel": "Cancel",
+    "generating": "Generating",
+    "initializing": "Initializing",
+    "modules": "Modules",
+    "packages": "Packages",
+    "finalizing": "Finalizing",
+    "versions": "Versions",
+    "available": "available",
+    "default": "default",
+    "viewing": "viewing",
+    "deleteConfirm": "Delete?",
+    "no": "No",
+    "yes": "Yes",
+    "view": "View",
+    "setDefault": "Set default",
+    "delete": "Delete",
+    "done": "Done",
+    "versionManager": "Version Manager",
+    "showToc": "Show TOC",
+    "tableOfContents": "Table of Contents"
+  },
+  "mermaid": {
+    "zoomActive": "Zoom active • Scroll to zoom • Drag to pan",
+    "hoverToZoom": "Hover to zoom • Drag to pan • Double-click for fullscreen"
+  },
+  "wiki": {
+    "diagramLoading": "Diagram will appear after generation..."
+  },
+  "folder": {
+    "createTitle": "Create New Folder",
+    "createIn": "Create in \"{name}\"",
+    "namePlaceholder": "Enter folder name",
+    "create": "Create",
+    "errorEmpty": "Folder name cannot be empty",
+    "errorTooLong": "Folder name cannot exceed 100 characters"
+  }
+}
