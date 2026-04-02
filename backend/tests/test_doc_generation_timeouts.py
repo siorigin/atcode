@@ -130,6 +130,96 @@ def test_generate_overview_background_emits_heartbeat_before_stalling(monkeypatc
     assert task_manager.updates[-1]["status"] == TaskStatus.STALLED
 
 
+class _ReentrySensitiveStream:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.inflight = False
+        self._release_tasks: list[asyncio.Task] = []
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "type": "status",
+                "content": "Child agents generating sections...",
+                "progress": 65,
+                "step": "children_working",
+                "details": {"phase": "dispatching"},
+            }
+
+        if self.inflight:
+            raise RuntimeError("anext(): asynchronous generator is already running")
+
+        self.inflight = True
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            async def _release() -> None:
+                await asyncio.sleep(0.05)
+                self.inflight = False
+
+            self._release_tasks.append(asyncio.create_task(_release()))
+            raise
+
+        self.inflight = False
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        self.inflight = False
+        for task in self._release_tasks:
+            task.cancel()
+        for task in self._release_tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+
+class _ReentrySensitiveOrchestrator:
+    def stream_generate(self, **kwargs):
+        return _ReentrySensitiveStream()
+
+
+def test_generate_overview_background_reuses_pending_next_during_heartbeats(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("OVERVIEW_PROGRESS_TIMEOUT_SECONDS", "0.03")
+    monkeypatch.setenv("OVERVIEW_PROGRESS_HEARTBEAT_SECONDS", "0.01")
+    monkeypatch.setenv("OVERVIEW_AUTO_RESUME_ON_STALL", "false")
+
+    task_manager = _FakeTaskManager()
+    monkeypatch.setattr(overview, "get_task_manager", lambda: task_manager)
+    monkeypatch.setattr(overview, "get_memgraph_ingestor", lambda: object())
+    monkeypatch.setattr(
+        overview,
+        "get_overview_orchestrator",
+        lambda **kwargs: _ReentrySensitiveOrchestrator(),
+    )
+    monkeypatch.setattr(overview, "get_wiki_doc_path", lambda: tmp_path)
+
+    asyncio.run(
+        overview._generate_overview_background(
+            task_id="task-reentry-safe",
+            repo="demo-repo",
+        )
+    )
+
+    heartbeat_updates = [
+        update
+        for update in task_manager.updates
+        if update.get("details", {}).get("heartbeat") is True
+    ]
+
+    assert len(heartbeat_updates) >= 2
+    assert not any(
+        update.get("status") == TaskStatus.FAILED for update in task_manager.updates
+    )
+    assert task_manager.updates[-1]["status"] == TaskStatus.STALLED
+
+
 class _FakeRunStore:
     def __init__(self) -> None:
         self.request: dict | None = None

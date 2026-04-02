@@ -477,6 +477,8 @@ async def _generate_overview_background(
         auto_resume_attempts = 0
         heartbeat_steps = {
             "children_working",
+            "child_tool_call",
+            "child_step_change",
             "resuming_sections",
             "resuming_section",
         }
@@ -515,136 +517,160 @@ async def _generate_overview_background(
             nonlocal last_progress
             nonlocal last_message
             nonlocal last_details
+            pending_event_task: asyncio.Task | None = None
 
-            while True:
-                elapsed = (datetime.now(UTC) - real_event_at).total_seconds()
-                remaining = inactivity_timeout_seconds - elapsed
-                if remaining <= 0:
-                    raise build_stall_error(
-                        last_event_at=real_event_at,
-                        step=last_step,
-                        progress=last_progress,
-                        message=last_message,
-                    )
-
-                wait_timeout = remaining
-                if last_step in heartbeat_steps:
-                    wait_timeout = min(wait_timeout, heartbeat_interval_seconds)
-
-                try:
-                    event = await asyncio.wait_for(anext(generator), timeout=wait_timeout)
-                except StopAsyncIteration:
-                    break
-                except asyncio.TimeoutError as exc:
-                    stalled_for = (datetime.now(UTC) - real_event_at).total_seconds()
-                    if (
-                        last_step in heartbeat_steps
-                        and stalled_for < inactivity_timeout_seconds
-                    ):
-                        heartbeat_message = build_heartbeat_message(
+            try:
+                while True:
+                    elapsed = (datetime.now(UTC) - real_event_at).total_seconds()
+                    remaining = inactivity_timeout_seconds - elapsed
+                    if remaining <= 0:
+                        raise build_stall_error(
+                            last_event_at=real_event_at,
                             step=last_step,
+                            progress=last_progress,
                             message=last_message,
-                            details=last_details,
-                            seconds_since_real_event=stalled_for,
                         )
-                        heartbeat_details = {
-                            **(last_details or {}),
-                            "heartbeat": True,
-                            "resume_mode": resume_mode,
-                            "seconds_since_last_real_event": round(stalled_for, 1),
-                            "heartbeat_interval_seconds": heartbeat_interval_seconds,
-                        }
+
+                    wait_timeout = remaining
+                    if last_step in heartbeat_steps:
+                        wait_timeout = min(wait_timeout, heartbeat_interval_seconds)
+
+                    if pending_event_task is None:
+                        pending_event_task = asyncio.create_task(anext(generator))
+
+                    try:
+                        event = await asyncio.wait_for(
+                            asyncio.shield(pending_event_task),
+                            timeout=wait_timeout,
+                        )
+                        pending_event_task = None
+                    except StopAsyncIteration:
+                        pending_event_task = None
+                        break
+                    except asyncio.TimeoutError as exc:
+                        stalled_for = (datetime.now(UTC) - real_event_at).total_seconds()
+                        if (
+                            last_step in heartbeat_steps
+                            and stalled_for < inactivity_timeout_seconds
+                        ):
+                            heartbeat_message = build_heartbeat_message(
+                                step=last_step,
+                                message=last_message,
+                                details=last_details,
+                                seconds_since_real_event=stalled_for,
+                            )
+                            heartbeat_details = {
+                                **(last_details or {}),
+                                "heartbeat": True,
+                                "resume_mode": resume_mode,
+                                "seconds_since_last_real_event": round(stalled_for, 1),
+                                "heartbeat_interval_seconds": heartbeat_interval_seconds,
+                            }
+                            await task_manager.update_task(
+                                task_id,
+                                status=TaskStatus.RUNNING,
+                                progress=last_progress,
+                                step=last_step,
+                                status_message=heartbeat_message,
+                                error="",
+                                details=heartbeat_details,
+                            )
+                            record_local_event(
+                                task_status=TaskStatus.RUNNING.value,
+                                progress=last_progress,
+                                step=last_step,
+                                message=heartbeat_message,
+                                details=heartbeat_details,
+                            )
+                            continue
+                        raise build_stall_error(
+                            last_event_at=real_event_at,
+                            step=last_step,
+                            progress=last_progress,
+                            message=last_message,
+                        ) from exc
+                    except Exception:
+                        if pending_event_task is not None and pending_event_task.done():
+                            pending_event_task = None
+                        raise
+
+                    event_type = event.get("type")
+                    real_event_at = datetime.now(UTC)
+                    last_step = event.get("step", last_step)
+                    last_progress = event.get("progress", last_progress)
+                    last_message = event.get("content", last_message)
+                    if isinstance(event.get("details"), dict):
+                        last_details = event.get("details")
+
+                    if event_type == "status":
                         await task_manager.update_task(
                             task_id,
-                            status=TaskStatus.RUNNING,
-                            progress=last_progress,
-                            step=last_step,
-                            status_message=heartbeat_message,
-                            error="",
-                            details=heartbeat_details,
+                            progress=event.get("progress", 0),
+                            step=event.get("step", ""),
+                            status_message=event.get("content", ""),
+                            details=event.get("details"),
                         )
                         record_local_event(
                             task_status=TaskStatus.RUNNING.value,
+                            progress=event.get("progress", 0),
+                            step=event.get("step", ""),
+                            message=event.get("content", ""),
+                            details=event.get("details"),
+                        )
+
+                    elif event_type == "complete":
+                        result = event.get("content", {})
+                        await task_manager.update_task(
+                            task_id,
+                            status=TaskStatus.COMPLETED,
+                            progress=100,
+                            step="complete",
+                            status_message="Documentation generation completed",
+                            result=result,
+                            details=event.get("details"),
+                        )
+                        record_local_event(
+                            task_status=TaskStatus.COMPLETED.value,
+                            progress=100,
+                            step="complete",
+                            message="Documentation generation completed",
+                            event_type="complete",
+                            details=event.get("details"),
+                            extra={"result": result},
+                        )
+                        logger.info(
+                            f"Documentation generation completed: {task_id} for {repo}"
+                        )
+
+                    elif event_type == "error":
+                        error_message = event.get("content", "Unknown error")
+                        await task_manager.update_task(
+                            task_id,
+                            status=TaskStatus.FAILED,
+                            error=error_message,
+                        )
+                        record_local_event(
+                            task_status=TaskStatus.FAILED.value,
                             progress=last_progress,
                             step=last_step,
-                            message=heartbeat_message,
-                            details=heartbeat_details,
+                            message=error_message,
+                            event_type="error",
+                            error=error_message,
+                            details=event.get("details"),
                         )
-                        continue
-                    raise build_stall_error(
-                        last_event_at=real_event_at,
-                        step=last_step,
-                        progress=last_progress,
-                        message=last_message,
-                    ) from exc
-
-                event_type = event.get("type")
-                real_event_at = datetime.now(UTC)
-                last_step = event.get("step", last_step)
-                last_progress = event.get("progress", last_progress)
-                last_message = event.get("content", last_message)
-                if isinstance(event.get("details"), dict):
-                    last_details = event.get("details")
-
-                if event_type == "status":
-                    await task_manager.update_task(
-                        task_id,
-                        progress=event.get("progress", 0),
-                        step=event.get("step", ""),
-                        status_message=event.get("content", ""),
-                        details=event.get("details"),
-                    )
-                    record_local_event(
-                        task_status=TaskStatus.RUNNING.value,
-                        progress=event.get("progress", 0),
-                        step=event.get("step", ""),
-                        message=event.get("content", ""),
-                        details=event.get("details"),
-                    )
-
-                elif event_type == "complete":
-                    result = event.get("content", {})
-                    await task_manager.update_task(
-                        task_id,
-                        status=TaskStatus.COMPLETED,
-                        progress=100,
-                        step="complete",
-                        status_message="Documentation generation completed",
-                        result=result,
-                        details=event.get("details"),
-                    )
-                    record_local_event(
-                        task_status=TaskStatus.COMPLETED.value,
-                        progress=100,
-                        step="complete",
-                        message="Documentation generation completed",
-                        event_type="complete",
-                        details=event.get("details"),
-                        extra={"result": result},
-                    )
-                    logger.info(
-                        f"Documentation generation completed: {task_id} for {repo}"
-                    )
-
-                elif event_type == "error":
-                    error_message = event.get("content", "Unknown error")
-                    await task_manager.update_task(
-                        task_id,
-                        status=TaskStatus.FAILED,
-                        error=error_message,
-                    )
-                    record_local_event(
-                        task_status=TaskStatus.FAILED.value,
-                        progress=last_progress,
-                        step=last_step,
-                        message=error_message,
-                        event_type="error",
-                        error=error_message,
-                        details=event.get("details"),
-                    )
-                    logger.error(
-                        f"Documentation generation failed: {task_id}, error: {error_message}"
-                    )
+                        logger.error(
+                            f"Documentation generation failed: {task_id}, error: {error_message}"
+                        )
+            finally:
+                if pending_event_task is not None and not pending_event_task.done():
+                    pending_event_task.cancel()
+                    with contextlib.suppress(
+                        asyncio.CancelledError,
+                        StopAsyncIteration,
+                        RuntimeError,
+                        TimeoutError,
+                    ):
+                        await asyncio.wait_for(pending_event_task, timeout=1.0)
 
         current_resume_mode = resume
         while True:

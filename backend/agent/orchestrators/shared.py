@@ -1015,7 +1015,7 @@ def _is_transient_error(error: Exception) -> bool:
 # When multiple child agents run in parallel (via LangGraph Send()), they can
 # saturate the LLM API proxy.  A module-level semaphore caps the number of
 # concurrent LLM invocations across all agents in this process.
-_LLM_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "3"))
+_LLM_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "10"))
 _llm_semaphore = asyncio.Semaphore(_LLM_CONCURRENCY)
 
 
@@ -1037,10 +1037,14 @@ async def _try_invoke(
     last_error: Exception | None = None
     for attempt in range(max_retries):
         try:
+            logger.debug(f"[{label}] Waiting for LLM semaphore (concurrency limit: {_LLM_CONCURRENCY})...")
             async with _llm_semaphore:
-                return await asyncio.wait_for(
+                logger.debug(f"[{label}] Acquired semaphore, invoking LLM (timeout: {timeout_seconds}s)...")
+                result = await asyncio.wait_for(
                     llm.ainvoke(messages), timeout=timeout_seconds
                 )
+                logger.debug(f"[{label}] LLM invocation completed successfully")
+                return result
         except asyncio.TimeoutError:
             last_error = TimeoutError(
                 f"{label} request timed out after {timeout_seconds:g}s"

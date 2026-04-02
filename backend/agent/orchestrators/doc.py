@@ -1379,12 +1379,14 @@ Please provide your evaluation:"""
             logger.info(f"Processing {len(inherited_messages)} inherited messages")
 
             # Use LLM to extract relevant context for this scope
+            logger.info(f"Depth {depth}: '{scope_title}' - Calling LLM for context extraction (may wait for semaphore)...")
             extracted_context = await self._extract_relevant_context_for_scope(
                 inherited_messages=inherited_messages,
                 scope_title=scope_title,
                 scope_description=scope_description,
                 key_components=key_components,
             )
+            logger.info(f"Depth {depth}: '{scope_title}' - LLM context extraction completed")
 
             # Build the context message to add to the conversation
             if extracted_context and len(extracted_context) > 50:
@@ -3304,145 +3306,230 @@ If generating, start with <Doc>True</Doc> followed by markdown content.
             last_outline_count = 0
             last_child_results_count = 0
             seen_tool_call_keys: set[str] = set()
-            # Use stream_mode="values" to get full state at each step
-            async for state in workflow.astream(
+            # Track child agent progress: {scope_title: {tool_count, explored_count, step}}
+            child_agent_progress: dict[str, dict[str, Any]] = {}
+            child_seen_tool_call_keys: dict[str, set[str]] = {}
+            # Use stream_mode="values" with subgraphs=True to see child agent state changes
+            async for namespace, state in workflow.astream(
                 initial_state,
                 {"recursion_limit": settings.LANGGRAPH_RECURSION_LIMIT},
                 stream_mode="values",
+                subgraphs=True,
             ):
-                if checkpoint_callback is not None:
-                    await _maybe_await(checkpoint_callback(dict(state)))
-                # state is the full DocAgentState at this point
-                current_step = state.get("current_step", "")
-                outline = state.get("outline", [])
-                child_results = state.get("child_results", [])
-                tool_count = state.get("tool_call_count", 0)
-                explored_count = len(state.get("explored_nodes", []))
-                outline_count = len(outline)
-                child_results_count = len(child_results)
-                messages = state.get("messages", [])
-                new_tool_calls = _collect_new_tool_calls(messages, seen_tool_call_keys)
-                common_details = {
-                    "phase": current_step or "running",
-                    "tool_call_count": tool_count,
-                    "explored_node_count": explored_count,
-                    "outline_count": outline_count,
-                    "outline_titles": _extract_titles(outline),
-                    "completed_section_count": child_results_count,
-                    "completed_section_titles": _extract_titles(child_results),
-                }
+                # namespace is a tuple: () for root, ("child_agent:...",) for child agents
+                is_child = len(namespace) > 0
 
-                if current_step != previous_step and current_step == "init":
-                    yield {
-                        "type": "status",
-                        "content": "Agent exploring knowledge graph...",
-                        "progress": 15,
-                        "step": "agent_exploring",
-                        "details": common_details,
-                    }
-                elif current_step != previous_step and current_step == "dispatching":
-                    yield {
-                        "type": "status",
-                        "content": "Child agents generating sections...",
-                        "progress": 65,
-                        "step": "children_working",
-                        "details": common_details,
+                if not is_child:
+                    # === ROOT AGENT STATE ===
+                    if checkpoint_callback is not None:
+                        await _maybe_await(checkpoint_callback(dict(state)))
+                    current_step = state.get("current_step", "")
+                    outline = state.get("outline", [])
+                    child_results = state.get("child_results", [])
+                    tool_count = state.get("tool_call_count", 0)
+                    explored_count = len(state.get("explored_nodes", []))
+                    outline_count = len(outline)
+                    child_results_count = len(child_results)
+                    messages = state.get("messages", [])
+                    new_tool_calls = _collect_new_tool_calls(messages, seen_tool_call_keys)
+                    common_details = {
+                        "phase": current_step or "running",
+                        "tool_call_count": tool_count,
+                        "explored_node_count": explored_count,
+                        "outline_count": outline_count,
+                        "outline_titles": _extract_titles(outline),
+                        "completed_section_count": child_results_count,
+                        "completed_section_titles": _extract_titles(child_results),
                     }
 
-                if new_tool_calls:
-                    latest_displays = [tc["display"] for tc in new_tool_calls[:3]]
-                    latest_summary = "; ".join(latest_displays)
-                    if len(new_tool_calls) == 1:
-                        content = f"Tool call: {latest_summary}"
-                    else:
-                        content = (
-                            f"Tool calls ({len(new_tool_calls)}): {latest_summary}"
+                    if current_step != previous_step and current_step == "init":
+                        yield {
+                            "type": "status",
+                            "content": "Agent exploring knowledge graph...",
+                            "progress": 15,
+                            "step": "agent_exploring",
+                            "details": common_details,
+                        }
+                    elif current_step != previous_step and current_step == "dispatching":
+                        yield {
+                            "type": "status",
+                            "content": "Child agents generating sections...",
+                            "progress": 65,
+                            "step": "children_working",
+                            "details": common_details,
+                        }
+
+                    if new_tool_calls:
+                        latest_displays = [tc["display"] for tc in new_tool_calls[:3]]
+                        latest_summary = "; ".join(latest_displays)
+                        if len(new_tool_calls) == 1:
+                            content = f"Tool call: {latest_summary}"
+                        else:
+                            content = (
+                                f"Tool calls ({len(new_tool_calls)}): {latest_summary}"
+                            )
+                        yield {
+                            "type": "status",
+                            "content": content,
+                            "progress": min(55, max(18, 15 + tool_count)),
+                            "step": "tool_call",
+                            "details": {
+                                **common_details,
+                                "recent_tool_calls": [
+                                    {
+                                        "name": tc["name"],
+                                        "display": tc["display"],
+                                        "args_summary": tc["args_summary"],
+                                        "result_preview": tc["result_preview"],
+                                    }
+                                    for tc in new_tool_calls[:5]
+                                ],
+                            },
+                        }
+
+                    if tool_count >= last_tool_report + 5:
+                        yield {
+                            "type": "status",
+                            "content": (
+                                f"Exploring knowledge graph... "
+                                f"{tool_count} tool calls, {explored_count} nodes collected"
+                            ),
+                            "progress": min(45, 15 + tool_count),
+                            "step": "agent_exploring",
+                            "details": {
+                                **common_details,
+                                "recent_tool_calls": [
+                                    {
+                                        "name": tc["name"],
+                                        "display": tc["display"],
+                                        "args_summary": tc["args_summary"],
+                                        "result_preview": tc["result_preview"],
+                                    }
+                                    for tc in new_tool_calls[-3:]
+                                ],
+                            },
+                        }
+                        last_tool_report = tool_count
+
+                    if state.get("should_delegate") and outline_count and (
+                        outline_count != last_outline_count
+                    ):
+                        yield {
+                            "type": "status",
+                            "content": f"Planned {outline_count} documentation sections for sub-agents...",
+                            "progress": 60,
+                            "step": "delegating",
+                            "details": common_details,
+                        }
+                        last_outline_count = outline_count
+
+                    if child_results_count and (
+                        child_results_count != last_child_results_count
+                    ):
+                        total_sections = max(outline_count, last_outline_count, child_results_count)
+                        aggregate_progress = min(
+                            90,
+                            70 + int(20 * (child_results_count / max(total_sections, 1))),
                         )
-                    yield {
-                        "type": "status",
-                        "content": content,
-                        "progress": min(55, max(18, 15 + tool_count)),
-                        "step": "tool_call",
-                        "details": {
-                            **common_details,
-                            "recent_tool_calls": [
-                                {
-                                    "name": tc["name"],
-                                    "display": tc["display"],
-                                    "args_summary": tc["args_summary"],
-                                    "result_preview": tc["result_preview"],
-                                }
-                                for tc in new_tool_calls[:5]
-                            ],
-                        },
-                    }
+                        yield {
+                            "type": "status",
+                            "content": (
+                                f"Aggregating documentation sections "
+                                f"({child_results_count}/{total_sections})..."
+                            ),
+                            "progress": aggregate_progress,
+                            "step": "aggregating",
+                            "details": common_details,
+                        }
+                        last_child_results_count = child_results_count
 
-                if tool_count >= last_tool_report + 5:
-                    yield {
-                        "type": "status",
-                        "content": (
-                            f"Exploring knowledge graph... "
-                            f"{tool_count} tool calls, {explored_count} nodes collected"
-                        ),
-                        "progress": min(45, 15 + tool_count),
-                        "step": "agent_exploring",
-                        "details": {
-                            **common_details,
-                            "recent_tool_calls": [
-                                {
-                                    "name": tc["name"],
-                                    "display": tc["display"],
-                                    "args_summary": tc["args_summary"],
-                                    "result_preview": tc["result_preview"],
-                                }
-                                for tc in new_tool_calls[-3:]
-                            ],
-                        },
-                    }
-                    last_tool_report = tool_count
+                    final_state = state
+                    previous_step = current_step
 
-                if state.get("should_delegate") and outline_count and (
-                    outline_count != last_outline_count
-                ):
-                    yield {
-                        "type": "status",
-                        "content": f"Planned {outline_count} documentation sections for sub-agents...",
-                        "progress": 60,
-                        "step": "delegating",
-                        "details": common_details,
-                    }
-                    last_outline_count = outline_count
-
-                if child_results_count and (
-                    child_results_count != last_child_results_count
-                ):
-                    total_sections = max(outline_count, last_outline_count, child_results_count)
-                    aggregate_progress = min(
-                        90,
-                        70 + int(20 * (child_results_count / max(total_sections, 1))),
+                    logger.debug(
+                        f"Stream state: step={current_step}, delegate={state.get('should_delegate')}, "
+                        f"outline_len={outline_count}, child_results_len={child_results_count}, "
+                        f"tool_call_count={tool_count}, explored_nodes={explored_count}"
                     )
-                    yield {
-                        "type": "status",
-                        "content": (
-                            f"Aggregating documentation sections "
-                            f"({child_results_count}/{total_sections})..."
-                        ),
-                        "progress": aggregate_progress,
-                        "step": "aggregating",
-                        "details": common_details,
+                else:
+                    # === CHILD AGENT STATE ===
+                    child_scope = state.get("scope_title", "")
+                    if not child_scope:
+                        continue
+                    child_tool_count = state.get("tool_call_count", 0)
+                    child_explored = len(state.get("explored_nodes", []))
+                    child_step = state.get("current_step", "")
+                    child_messages = state.get("messages", [])
+
+                    # Track per-child seen tool calls
+                    if child_scope not in child_seen_tool_call_keys:
+                        child_seen_tool_call_keys[child_scope] = set()
+                    child_new_tool_calls = _collect_new_tool_calls(
+                        child_messages, child_seen_tool_call_keys[child_scope]
+                    )
+
+                    prev = child_agent_progress.get(child_scope, {})
+                    prev_tool_count = prev.get("tool_count", 0)
+                    prev_step = prev.get("step", "")
+
+                    # Update tracking
+                    child_agent_progress[child_scope] = {
+                        "tool_count": child_tool_count,
+                        "explored_count": child_explored,
+                        "step": child_step,
                     }
-                    last_child_results_count = child_results_count
 
-                # Track the latest full state
-                final_state = state
-                previous_step = current_step
-
-                # Log progress
-                logger.debug(
-                    f"Stream state: step={current_step}, delegate={state.get('should_delegate')}, "
-                    f"outline_len={outline_count}, child_results_len={child_results_count}, "
-                    f"tool_call_count={tool_count}, explored_nodes={explored_count}"
-                )
+                    # Emit child tool calls
+                    if child_new_tool_calls:
+                        latest_displays = [tc["display"] for tc in child_new_tool_calls[:3]]
+                        latest_summary = "; ".join(latest_displays)
+                        total_sections = max(last_outline_count, 1)
+                        completed = last_child_results_count
+                        child_base_progress = 65 + int(
+                            20 * (completed / total_sections)
+                        )
+                        yield {
+                            "type": "status",
+                            "content": f"[{child_scope}] Tool calls ({len(child_new_tool_calls)}): {latest_summary}",
+                            "progress": min(89, child_base_progress),
+                            "step": "child_tool_call",
+                            "details": {
+                                "phase": "child_working",
+                                "child_scope": child_scope,
+                                "child_tool_count": child_tool_count,
+                                "child_explored_count": child_explored,
+                                "child_step": child_step,
+                                "child_agent_progress": {
+                                    k: v for k, v in child_agent_progress.items()
+                                },
+                                "recent_tool_calls": [
+                                    {
+                                        "name": tc["name"],
+                                        "display": tc["display"],
+                                        "args_summary": tc["args_summary"],
+                                        "result_preview": tc["result_preview"],
+                                    }
+                                    for tc in child_new_tool_calls[:5]
+                                ],
+                            },
+                        }
+                    # Emit child step transitions (e.g. exploring -> deciding -> generating)
+                    elif child_step and child_step != prev_step:
+                        yield {
+                            "type": "status",
+                            "content": f"[{child_scope}] {child_step}",
+                            "progress": min(89, 65 + int(20 * (last_child_results_count / max(last_outline_count, 1)))),
+                            "step": "child_step_change",
+                            "details": {
+                                "phase": "child_working",
+                                "child_scope": child_scope,
+                                "child_step": child_step,
+                                "child_tool_count": child_tool_count,
+                                "child_agent_progress": {
+                                    k: v for k, v in child_agent_progress.items()
+                                },
+                            },
+                        }
 
             # Write documentation
             if final_state:
