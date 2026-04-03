@@ -49,6 +49,12 @@ AtCode 是一个本地优先的代码智能系统。它基于 Tree-sitter 将代
 
 ---
 
+<div align="center">
+  <img src="./docs/arch.png" width="960" alt="AtCode Architecture">
+</div>
+
+---
+
 ## 快速开始
 
 > 说明：下面每种启动方式都保留了“最短可执行命令”。更详细的运行机制、重启方法和管理说明已折叠，可点击展开。

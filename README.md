@@ -49,6 +49,12 @@ AtCode is a local-first code intelligence system. It uses Tree-sitter to build a
 
 ---
 
+<div align="center">
+  <img src="./docs/arch.png" width="960" alt="AtCode Architecture">
+</div>
+
+---
+
 ## Quick Start
 
 > Note: each startup mode below keeps the shortest runnable command path. More operational details, restart guidance, and management notes are folded under expandable sections.
