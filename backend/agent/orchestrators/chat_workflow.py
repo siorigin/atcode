@@ -31,6 +31,7 @@ from .context import (
 from .shared import (
     extract_qualified_names,
     get_recent_tool_messages,
+    greedy_split_tool_names,
     invoke_with_retry,
     last_value,
     max_value,
@@ -68,31 +69,8 @@ class ChatState(TypedDict):
 def _greedy_split_tool_names(
     concatenated: str, valid_names: set[str]
 ) -> list[str] | None:
-    """Split a concatenated tool name string into valid tool names.
-
-    Uses greedy matching — tries the longest valid name at each position.
-    Returns None if the string cannot be fully decomposed.
-
-    Example:
-        "get_paper_docget_children" → ["get_paper_doc", "get_children"]
-    """
-    # Sort by length descending so we try longest matches first
-    sorted_names = sorted(valid_names, key=len, reverse=True)
-    result: list[str] = []
-    remaining = concatenated
-
-    while remaining:
-        matched = False
-        for name in sorted_names:
-            if remaining.startswith(name):
-                result.append(name)
-                remaining = remaining[len(name):]
-                matched = True
-                break
-        if not matched:
-            return None
-
-    return result if len(result) >= 2 else None
+    """Delegate to shared implementation."""
+    return greedy_split_tool_names(concatenated, valid_names)
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +222,7 @@ def create_chat_workflow(
         response = await invoke_with_retry(
             llm_with_tools, messages, label="chat_agent",
             config=settings.active_llm_config,
+            tools=captured_tools,
         )
         response = _split_concatenated_tool_calls(response)
         return {"messages": [response]}

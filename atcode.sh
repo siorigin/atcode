@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # AtCode — unified bootstrap script
 # Usage:
-#   ./atcode.sh up        # check/install deps, start infra, install deps, then start backend + frontend
-#   ./atcode.sh refresh   # restart backend + frontend only (keep memgraph/redis running)
+#   ./atcode.sh up [dev|prod]        # check/install deps, start infra, install deps, then start backend + frontend
+#   ./atcode.sh refresh [target] [dev|prod]   # restart app services only (keep memgraph/redis running)
 #   ./atcode.sh down       # stop everything
 #   ./atcode.sh status     # show running state
 #   ./atcode.sh logs       # tail backend + frontend logs
@@ -43,6 +43,23 @@ resolve_compose_host_path() {
     fi
 }
 
+resolve_frontend_mode() {
+    local requested="${1:-${FRONTEND_MODE:-prod}}"
+    case "$requested" in
+        ""|prod|--prod)
+            printf 'prod\n'
+            ;;
+        dev|--dev)
+            printf 'dev\n'
+            ;;
+        *)
+            err "Unknown frontend mode: $requested"
+            echo "Use 'prod' or 'dev'."
+            return 1
+            ;;
+    esac
+}
+
 # ── load .env ────────────────────────────────────────────────────────────────
 load_env() {
     if [ ! -f "$PROJECT_ROOT/.env" ]; then
@@ -76,6 +93,7 @@ load_env() {
     COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-$COMPOSE_PROJECT_NAME_DEFAULT}"
     HOST_UID="${HOST_UID:-$(id -u)}"
     HOST_GID="${HOST_GID:-$(id -g)}"
+    FRONTEND_MODE="${FRONTEND_MODE:-prod}"
     ATCODE_DATA_DIR="${ATCODE_DATA_DIR:-../data}"
     REDIS_DATA_DIR="${REDIS_DATA_DIR:-../data/redis}"
     export DOCKER_IMAGE_PREFIX
@@ -84,6 +102,7 @@ load_env() {
     export COMPOSE_PROJECT_NAME
     export HOST_UID
     export HOST_GID
+    export FRONTEND_MODE
     export ATCODE_DATA_DIR
     export REDIS_DATA_DIR
     mkdir -p "$LOG_DIR" 2>/dev/null || true
@@ -390,15 +409,17 @@ start_backend() {
 }
 
 start_frontend() {
+    local frontend_mode
+    frontend_mode="$(resolve_frontend_mode "${1:-}")" || return 1
     header "Starting frontend"
     if [ -f "$PID_DIR/frontend.pid" ] && kill -0 "$(cat "$PID_DIR/frontend.pid")" 2>/dev/null; then
         info "Frontend already running (PID $(cat "$PID_DIR/frontend.pid"))"
         return
     fi
     cd "$PROJECT_ROOT"
-    nohup bash "$PROJECT_ROOT/scripts/start_front.sh" --no-install > "$LOG_DIR/frontend.log" 2>&1 &
+    nohup bash "$PROJECT_ROOT/scripts/start_front.sh" "--$frontend_mode" --no-install > "$LOG_DIR/frontend.log" 2>&1 &
     echo $! > "$PID_DIR/frontend.pid"
-    info "Frontend started (PID $!) — log: $LOG_DIR/frontend.log"
+    info "Frontend started in ${frontend_mode} mode (PID $!) — log: $LOG_DIR/frontend.log"
 }
 
 stop_process() {
@@ -423,13 +444,15 @@ stop_process() {
 # ── commands ─────────────────────────────────────────────────────────────────
 cmd_up() {
     load_env
+    local frontend_mode
+    frontend_mode="$(resolve_frontend_mode "${1:-}")" || return 1
     check_deps
     check_env
     start_infra
     install_python_deps
     install_frontend_deps
     start_backend
-    start_frontend
+    start_frontend "$frontend_mode"
 
     echo ""
     echo -e "${GREEN}============================================${NC}"
@@ -457,6 +480,7 @@ cmd_refresh() {
     load_env
 
     local target="${1:-all}"
+    local frontend_mode="${2:-}"
     header "Refreshing AtCode application services"
 
     case "$target" in
@@ -464,7 +488,7 @@ cmd_refresh() {
             stop_process frontend
             stop_process backend
             start_backend
-            start_frontend
+            start_frontend "$frontend_mode"
             ;;
         backend)
             stop_process backend
@@ -472,11 +496,11 @@ cmd_refresh() {
             ;;
         frontend)
             stop_process frontend
-            start_frontend
+            start_frontend "$frontend_mode"
             ;;
         *)
             err "Unknown refresh target: $target"
-            echo "Usage: $0 refresh [backend|frontend|all]"
+            echo "Usage: $0 refresh [backend|frontend|all] [dev|prod]"
             return 1
             ;;
     esac
@@ -519,7 +543,7 @@ cmd_logs() {
 
 # ── main ─────────────────────────────────────────────────────────────────────
 case "${1:-}" in
-    up)     cmd_up ;;
+    up)     shift; cmd_up "$@" ;;
     refresh) shift; cmd_refresh "$@" ;;
     down)   cmd_down ;;
     status) cmd_status ;;
@@ -527,9 +551,10 @@ case "${1:-}" in
     *)
         echo "Usage: $0 {up|refresh|down|status|logs}"
         echo ""
-        echo "  up      Check/install deps, start infra + backend + frontend"
+        echo "  up [dev|prod]      Check/install deps, start infra + backend + frontend"
         echo "  refresh Restart backend/frontend only; keep docker infra running"
         echo "          Optional target: backend | frontend | all"
+        echo "          Optional frontend mode: dev | prod (default: prod)"
         echo "  down    Stop everything (frontend, backend, docker infra)"
         echo "  status  Show running state"
         echo "  logs    Tail backend and frontend logs"

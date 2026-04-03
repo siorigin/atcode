@@ -40,11 +40,11 @@ function ResearchIcon({ size = 18, color }: { size?: number; color?: string }) {
 
 function CollapseIcon({ collapsed }: { collapsed: boolean }) {
   return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+    <svg width="10" height="14" viewBox="0 0 10 14" fill="currentColor">
       {collapsed ? (
-        <path d="M9 18l6-6-6-6" />
+        <polygon points="1,0 10,7 1,14" />
       ) : (
-        <path d="M15 18l-6-6 6-6" />
+        <polygon points="9,0 0,7 9,14" />
       )}
     </svg>
   );
@@ -117,23 +117,25 @@ export function PageShellSidebar() {
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            width: '26px',
-            height: '26px',
-            background: 'transparent',
-            border: 'none',
+            width: '28px',
+            height: '28px',
+            background: colors.bgHover,
+            border: `1px solid ${colors.borderLight}`,
             borderRadius: '6px',
             cursor: 'pointer',
-            color: colors.textMuted,
+            color: colors.textSecondary,
             flexShrink: 0,
             transition: 'all 0.15s ease',
           }}
           onMouseEnter={(e) => {
-            e.currentTarget.style.background = colors.bgHover;
-            e.currentTarget.style.color = colors.text;
+            e.currentTarget.style.background = colors.accentBg;
+            e.currentTarget.style.borderColor = colors.accentBorder;
+            e.currentTarget.style.color = colors.accent;
           }}
           onMouseLeave={(e) => {
-            e.currentTarget.style.background = 'transparent';
-            e.currentTarget.style.color = colors.textMuted;
+            e.currentTarget.style.background = colors.bgHover;
+            e.currentTarget.style.borderColor = colors.borderLight;
+            e.currentTarget.style.color = colors.textSecondary;
           }}
         >
           <CollapseIcon collapsed={sidebarCollapsed} />

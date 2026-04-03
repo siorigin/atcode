@@ -397,6 +397,7 @@ async function runStreamLoop(
                   toolCalls: event.metadata?.tool_calls,
                   exploredNodes: (event.metadata?.explored_nodes as any[])?.length || 0,
                   toolTrace: event.metadata?.tool_trace || [...localToolTrace],
+                  contextStats: event.metadata?.context_stats || null,
                 };
 
                 if (event.metadata?.references && (event.metadata.references as any[]).length > 0) {

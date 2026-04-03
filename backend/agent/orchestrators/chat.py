@@ -317,10 +317,13 @@ class ChatOrchestrator:
             user_message = HumanMessage(content=message)
             messages = list(session_state.messages) + [user_message]
 
-            # Paper chat: apply sliding window to limit context size
-            if _is_papers and len(session_state.messages) > 0:
-                messages = self._trim_messages_for_papers(
-                    messages, session_state.extraction_summaries
+            # Sliding window to limit context size
+            context_stats = {}
+            if len(session_state.messages) > 0:
+                _max_turns = 4 if _is_papers else 8
+                messages, context_stats = self._trim_messages_for_papers(
+                    messages, session_state.extraction_summaries,
+                    max_turns=_max_turns,
                 )
             initial_state = {
                 "messages": messages,
@@ -651,6 +654,7 @@ class ChatOrchestrator:
                     "code_blocks": parsed_data.get("code_blocks", []),
                     "accumulated_code_blocks": filtered_blocks,
                     "tool_trace": turn_tool_trace,
+                    "context_stats": context_stats,
                 },
             }
 
@@ -702,7 +706,7 @@ class ChatOrchestrator:
         extraction_summaries: list[str],
         max_turns: int = 4,
         max_tool_output_chars: int = 4000,
-    ) -> list[BaseMessage]:
+    ) -> tuple[list[BaseMessage], dict[str, Any]]:
         """Trim old turns for paper chat, keeping last N complete turns + summary prefix.
 
         A "turn" starts at each ``HumanMessage``.  We scan backwards to find the
@@ -712,17 +716,23 @@ class ChatOrchestrator:
 
         Additionally, truncates oversized tool outputs in **older** turns (all but
         the most recent turn) to prevent massive payloads from hitting the API.
+
+        Returns:
+            Tuple of (trimmed messages, context_stats dict).
         """
         # Find positions of all HumanMessages
         human_indices = [
             i for i, m in enumerate(messages) if isinstance(m, HumanMessage)
         ]
+        total_turns = len(human_indices)
 
         trimmed = messages
+        trimmed_flag = False
         if len(human_indices) > max_turns:
             # Cut point: keep from the (max_turns)-th-from-last HumanMessage onward
             cut_index = human_indices[-max_turns]
             trimmed = messages[cut_index:]
+            trimmed_flag = True
 
         # Truncate oversized tool outputs in older turns (not the current turn).
         # The current turn starts at the last HumanMessage.
@@ -758,13 +768,30 @@ class ChatOrchestrator:
             )
             trimmed = [SystemMessage(content=summary_text)] + trimmed
 
-        if len(trimmed) != len(messages) or truncated_count > 0:
+        # Approximate token count: chars / 4
+        total_chars = sum(
+            len(m.content) if isinstance(m.content, str) else len(str(m.content))
+            for m in trimmed
+        )
+        approx_tokens = total_chars // 4
+
+        kept_turns = min(total_turns, max_turns)
+        context_stats = {
+            "total_turns": total_turns,
+            "kept_turns": kept_turns,
+            "trimmed": trimmed_flag,
+            "message_count": len(trimmed),
+            "approx_tokens": approx_tokens,
+            "summaries_count": len(extraction_summaries),
+        }
+
+        if trimmed_flag or truncated_count > 0:
             logger.info(
-                f"Paper chat sliding window: {len(messages)} msgs → {len(trimmed)} "
-                f"(kept last {max_turns} turns, {len(extraction_summaries)} summaries, "
-                f"{truncated_count} tool outputs truncated)"
+                f"Chat sliding window: {len(messages)} msgs → {len(trimmed)} "
+                f"(kept last {kept_turns}/{total_turns} turns, {len(extraction_summaries)} summaries, "
+                f"{truncated_count} tool outputs truncated, ~{approx_tokens} tokens)"
             )
-        return trimmed
+        return trimmed, context_stats
 
     # ------------------------------------------------------------------
     # Lightweight page context injection

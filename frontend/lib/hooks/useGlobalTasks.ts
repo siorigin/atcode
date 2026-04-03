@@ -123,9 +123,9 @@ export function useGlobalTasks(
   options: UseGlobalTasksOptions = {}
 ): UseGlobalTasksReturn {
   const {
-    pollInterval = 5000, // Increased from 3000 to 5000ms
+    pollInterval = 3000, // Reduced from 5000 to 3000ms for faster status updates
     autoStart = true,
-    stopWhenInactive = true, // New: stop polling when no active tasks
+    stopWhenInactive = true,
     taskType,
     repoName,
     onTaskComplete,
@@ -478,13 +478,22 @@ export function useGlobalTasks(
         setIsWebSocketConnected(false);
       });
 
+    // Monitor connection state — restart polling when WS disconnects
+    const unsubConn = wsClient.onConnectionStateChange((connected) => {
+      setIsWebSocketConnected(connected);
+      if (!connected && !pollIntervalRef.current) {
+        startPolling();
+      }
+    });
+
     return () => {
+      unsubConn();
       if (wsUnsubscribeRef.current) {
         wsUnsubscribeRef.current();
         wsUnsubscribeRef.current = null;
       }
     };
-  }, [handleWebSocketUpdate]);
+  }, [handleWebSocketUpdate, startPolling]);
 
   // Event compensation mechanism
   // Periodically fetch missed events from Redis Stream for reliability

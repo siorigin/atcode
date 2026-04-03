@@ -9,6 +9,8 @@
 
 *将代码仓库转化为可查询的 AST 知识图谱，让 AI 沿着结构、调用链和依赖关系理解代码，而非仅依赖文本切片。*
 
+<video src="./docs/display.mp4" controls width="800"></video>
+
 <p>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg?style=for-the-badge&labelColor=1a1a2e"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.12+-4ecdc4?style=for-the-badge&logo=python&logoColor=white&labelColor=1a1a2e"></a>

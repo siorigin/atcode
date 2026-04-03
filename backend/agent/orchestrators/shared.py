@@ -713,7 +713,7 @@ def match_node_flexible(
                 ]
             if basename_results:
                 best_node = min(
-                    basename_results, key=lambda x: len(x.get("qualified_name", ""))
+                    basename_results, key=lambda x: len(x.get("qualified_name") or "")
                 )
                 if not best_node.get("code") and best_node.get("path"):
                     code = retrieve_code_cross_repo(
@@ -980,11 +980,47 @@ def generate_code_block_id(file_path: str, start_line: int, end_line: int) -> st
 
 
 # =============================================================================
+# TOOL NAME CONCATENATION FIX
+# =============================================================================
+
+
+def greedy_split_tool_names(
+    concatenated: str, valid_names: set[str]
+) -> list[str] | None:
+    """Split a concatenated tool name string into valid tool names.
+
+    Uses greedy matching — tries the longest valid name at each position.
+    Returns None if the string cannot be fully decomposed.
+
+    Example:
+        "find_nodesfind_nodes" → ["find_nodes", "find_nodes"]
+    """
+    sorted_names = sorted(valid_names, key=len, reverse=True)
+    result: list[str] = []
+    remaining = concatenated
+
+    while remaining:
+        matched = False
+        for name in sorted_names:
+            if remaining.startswith(name):
+                result.append(name)
+                remaining = remaining[len(name):]
+                matched = True
+                break
+        if not matched:
+            return None
+
+    return result if len(result) >= 2 else None
+
+
+# =============================================================================
 # LLM RETRY WITH AUTO-FALLBACK
 # =============================================================================
 
-_DEFAULT_MAX_RETRIES = 3
-_DEFAULT_RETRY_DELAYS = [3, 8, 15]  # seconds — exponential backoff, ~26s total
+_DEFAULT_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "8"))
+_DEFAULT_RETRY_DELAYS = [
+    int(x) for x in os.getenv("LLM_RETRY_DELAYS", "10,15,30,45,60,60,60").split(",")
+]  # seconds — ~280s total, configurable via env
 
 # Transient error keywords that warrant retry
 _TRANSIENT_KEYWORDS = [
@@ -1074,6 +1110,7 @@ async def invoke_with_retry(
     max_retries: int = _DEFAULT_MAX_RETRIES,
     retry_delays: list[int] | None = None,
     config: Any | None = None,
+    tools: list | None = None,
 ) -> Any:
     """Invoke an LLM with retry and automatic model fallback.
 
@@ -1093,13 +1130,18 @@ async def invoke_with_retry(
     label:
         Human-readable label for log messages.
     max_retries:
-        Number of retry attempts per model (default 3).
+        Number of retry attempts per model (default 8, env: LLM_MAX_RETRIES).
     retry_delays:
-        Delay (seconds) between retries.  Defaults to ``[3, 8, 15]``.
+        Delay (seconds) between retries.  Defaults to ``[10, 15, 30, 45, 60, 60, 60]``
+        (env: LLM_RETRY_DELAYS).
     config:
         A ``ModelConfig`` (from ``core.config``) with ``endpoint`` and ``api_key``.
         Needed to create fallback LLM instances and to query the model list.
         If ``None``, no fallback is attempted.
+    tools:
+        Optional list of LangChain tools to bind to fallback models.
+        When the primary LLM has tools bound (via ``bind_tools``), pass the
+        original tool list here so fallback models get the same binding.
     """
     if retry_delays is None:
         retry_delays = list(_DEFAULT_RETRY_DELAYS)
@@ -1157,7 +1199,9 @@ async def invoke_with_retry(
 
             fb_config = replace(config, model_id=fb_model_id)
             fb_llm = create_model(fb_config)
-            logger.info(f"[{label}] Trying fallback model: {fb_model_id}")
+            if tools:
+                fb_llm = fb_llm.bind_tools(tools)
+            logger.info(f"[{label}] Trying fallback model: {fb_model_id} (tools={'yes' if tools else 'no'})")
             return await _try_invoke(
                 fb_llm,
                 messages,

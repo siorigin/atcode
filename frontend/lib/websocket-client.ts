@@ -65,8 +65,8 @@ export class TaskWebSocketClient {
   private taskUpdateListeners: Set<TaskUpdateCallback> = new Set();
   private connectionStateListeners: Set<ConnectionStateCallback> = new Set();
   private reconnectAttempts = 0;
-  private maxReconnectAttempts = 5;
-  private reconnectDelay = 1000; // Start at 1 second
+  private maxReconnectAttempts = 20;
+  private reconnectDelay = 1000;
   private reconnectTimeout: NodeJS.Timeout | null = null;
   private isManualClose = false;
 
@@ -161,7 +161,7 @@ export class TaskWebSocketClient {
     }
 
     this.reconnectAttempts++;
-    const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
+    const delay = Math.min(this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1), 30000);
 
     console.log(
       `Attempting to reconnect... (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts}, delay: ${delay}ms)`

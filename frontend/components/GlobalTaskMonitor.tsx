@@ -22,7 +22,7 @@ export interface GlobalTaskMonitorProps {
 }
 
 export function GlobalTaskMonitor({
-  position = 'bottom-right',
+  position = 'bottom-left',
 }: GlobalTaskMonitorProps) {
   return (
     <TaskStatusPanel

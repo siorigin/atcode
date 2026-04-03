@@ -58,11 +58,15 @@ const nextConfig: NextConfig = {
   // 排除大型数据目录，避免 standalone 复制几万个文件
   // API routes 在运行时直接读原始路径，不需要复制进 standalone
   outputFileTracingExcludes: {
-    '**': [
-      'data/wiki_repos/**',
-      'data/wiki_chat/**',
-      'data/wiki_overview/**',
-      'data/papers/**',
+    '/*': [
+      '../data/wiki_repos/**',
+      '../data/wiki_chat/**',
+      '../data/wiki_doc/**',
+      '../data/wiki_embedding/**',
+      '../data/wiki_papers/**',
+      '../data/wiki_overview/**',
+      '../data/redis/**',
+      '../data/logs/**',
     ],
   },
 

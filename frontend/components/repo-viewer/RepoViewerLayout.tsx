@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import React, {
-  useState, useCallback, useRef, useMemo,
+  useState, useCallback, useRef, useMemo, lazy, Suspense,
   useImperativeHandle, forwardRef, useEffect,
 } from 'react';
 import { useTheme } from '@/lib/theme-context';
@@ -27,6 +27,8 @@ import { CodeViewPanel } from './CodeViewPanel';
 import { apiFetch } from '@/lib/api-client';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { customSyntaxTheme, customSyntaxThemeLight, customSyntaxThemeBeige } from '@/lib/syntax-theme';
+
+const SyncPanel = lazy(() => import('@/components/SyncPanel').then(m => ({ default: m.SyncPanel })));
 
 // --- SVG Icons ---
 
@@ -70,6 +72,7 @@ export const RepoViewerLayout = forwardRef<RepoViewerHandle, RepoViewerLayoutPro
     const [viewMode, setViewMode] = useState<ViewMode>('code');
     const [highlightLine, setHighlightLine] = useState<number | null>(null);
     const [currentScrollLine, setCurrentScrollLine] = useState<number>(1);
+    const [showSyncPanel, setShowSyncPanel] = useState(false);
 
     // --- Navigation history ---
     const [navHistory, setNavHistory] = useState<NavEntry[]>([]);
@@ -252,7 +255,7 @@ export const RepoViewerLayout = forwardRef<RepoViewerHandle, RepoViewerLayoutPro
     }, [codeContent, blame, symbolNav]);
 
     const handleBranchChange = useCallback(async (_branch: string) => {
-      // TODO: implement branch checkout via API
+      setShowSyncPanel(true);
     }, []);
 
     const handleCurrentLineChange = useCallback((line: number) => {
@@ -499,6 +502,57 @@ export const RepoViewerLayout = forwardRef<RepoViewerHandle, RepoViewerLayoutPro
 
         {/* Right sidebar: Symbol navigation (on-demand) */}
         {symbolNavOpen && renderSymbolNavSidebar()}
+
+        {/* Git management popover */}
+        {showSyncPanel && (
+          <div style={{
+            position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+            zIndex: 300, display: 'flex', alignItems: 'flex-start', justifyContent: 'center',
+            paddingTop: '60px',
+          }}>
+            {/* Click-outside backdrop */}
+            <div
+              style={{ position: 'absolute', inset: 0 }}
+              onClick={() => setShowSyncPanel(false)}
+            />
+            <div style={{
+              position: 'relative', zIndex: 1,
+              width: '420px', maxHeight: 'calc(100% - 100px)',
+              background: colors.card, border: `1px solid ${colors.borderLight}`,
+              borderRadius: '12px', boxShadow: `0 12px 40px ${colors.shadowColor}`,
+              overflow: 'auto',
+            }}>
+              <div style={{
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                padding: '12px 16px', borderBottom: `1px solid ${colors.borderLight}`,
+              }}>
+                <span style={{ fontSize: '14px', fontWeight: 600, color: colors.text }}>
+                  Git Management - {repoName}
+                </span>
+                <button
+                  onClick={() => setShowSyncPanel(false)}
+                  style={{
+                    background: 'transparent', border: 'none', color: colors.textMuted,
+                    cursor: 'pointer', fontSize: '18px', padding: '2px 6px', borderRadius: '4px',
+                  }}
+                  onMouseEnter={(e) => { e.currentTarget.style.color = colors.text; e.currentTarget.style.background = colors.bgHover; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.color = colors.textMuted; e.currentTarget.style.background = 'transparent'; }}
+                >
+                  {'\u00D7'}
+                </button>
+              </div>
+              <Suspense fallback={<div style={{ padding: '24px', textAlign: 'center', color: colors.textMuted, fontSize: '13px' }}>Loading...</div>}>
+                <SyncPanel
+                  projectName={repoName}
+                  hasGraph={true}
+                  onSyncComplete={async () => { branchHook.loadBranches(); }}
+                  onCheckoutStart={() => {}}
+                  onError={(err) => console.error('Git error:', err)}
+                />
+              </Suspense>
+            </div>
+          </div>
+        )}
       </div>
     );
   }

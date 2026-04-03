@@ -227,9 +227,10 @@ export function PaperWorkspace({ paper, hasDoc, onBack, onPipelineComplete }: Pa
                 onClick={() => setNavCollapsed(c => !c)}
                 style={{
                   position: 'absolute', top: 4, left: navCollapsed ? 4 : 196, zIndex: 20,
-                  width: 20, height: 20, padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  background: colors.card, border: `1px solid ${colors.border}`, borderRadius: 4,
-                  cursor: 'pointer', color: colors.textMuted, fontSize: 10, lineHeight: 1,
+                  width: 24, height: 24, padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  background: colors.accent, border: 'none', borderRadius: '50%',
+                  cursor: 'pointer', color: '#fff', fontSize: 11, lineHeight: 1,
+                  boxShadow: '0 2px 6px rgba(0,0,0,0.2)',
                   transition: 'left 0.15s ease',
                 }}
                 title={navCollapsed ? 'Show sidebar' : 'Hide sidebar'}

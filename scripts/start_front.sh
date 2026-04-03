@@ -2,9 +2,9 @@
 # AtCode Frontend (Next.js) Startup Script
 #
 # Usage:
-#   ./scripts/start_front.sh            # Start frontend in default dev mode; install deps if needed
-#   ./scripts/start_front.sh --dev      # Dev mode (default)
-#   ./scripts/start_front.sh --prod     # Prod mode (build + start)
+#   ./scripts/start_front.sh            # Start frontend in default prod mode (build + start)
+#   ./scripts/start_front.sh --dev      # Dev mode
+#   ./scripts/start_front.sh --prod     # Prod mode (build + start, default)
 #   ./scripts/start_front.sh --host 0.0.0.0 --port 3006
 #   ./scripts/start_front.sh --no-install  # Skip npm install check when deps are already present
 #
@@ -23,7 +23,7 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-MODE="dev"
+MODE="prod"
 HOST="${FRONTEND_HOST:-0.0.0.0}"
 NO_INSTALL=false
 
@@ -45,6 +45,7 @@ fi
 # Re-apply defaults if .env didn't set them
 HOST="${FRONTEND_HOST:-$HOST}"
 PORT="${PORT:-3007}"
+MODE="${FRONTEND_MODE:-$MODE}"
 
 # ---------------------------------------------------------------------------
 # Make backend config available to the browser bundle.
@@ -138,11 +139,8 @@ echo ""
 
 # Next.js CLI flags: -p/--port, -H/--hostname
 if [ "$MODE" = "prod" ]; then
-  # Ensure build exists; build if missing
-  if [ ! -d ".next" ]; then
-    echo -e "${YELLOW}No .next build found; running build...${NC}"
-    npm run build
-  fi
+  echo -e "${CYAN}Running production build...${NC}"
+  npm run build
 
   # Copy static files to standalone directory (required by standalone mode)
   if [ -d ".next/standalone/frontend" ]; then

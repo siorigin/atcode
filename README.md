@@ -9,6 +9,8 @@
 
 *Turn a code repository into a queryable AST knowledge graph so AI can reason through structure, call chains, and dependencies instead of relying only on text chunks.*
 
+<video src="./docs/display.mp4" controls width="800"></video>
+
 <p>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg?style=for-the-badge&labelColor=1a1a2e"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.12+-4ecdc4?style=for-the-badge&logo=python&logoColor=white&labelColor=1a1a2e"></a>

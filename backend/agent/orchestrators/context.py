@@ -436,7 +436,7 @@ def identify_messages_to_extract(
         if not (isinstance(msg.content, str) and msg.content.startswith("[Extracted]"))
     ]
 
-    msgs_to_process = unprocessed_older[: config.messages_per_round]
+    msgs_to_process = unprocessed_older
 
     if not msgs_to_process:
         return [], [], []

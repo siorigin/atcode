@@ -4,7 +4,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import * as fs from 'fs';
 import * as path from 'path';
-import { getWikiReposDir, getDataDir, normalizeDataPath } from '@/lib/paths';
+import { getWikiReposDir, normalizeDataPath } from '@/lib/paths';
 
 // Force dynamic rendering - this route uses dynamic file paths
 export const dynamic = 'force-dynamic';
@@ -28,7 +28,6 @@ export async function GET(request: NextRequest) {
     // 🔧 支持跨仓库路径格式：data/wiki_repos/repo_name/file/path 或 wiki_repos/repo_name/file/path (legacy)
     // 或者直接的文件路径（假设在当前 repo 下）
     let fullFilePath: string;
-    const dataDir = getDataDir();
     const wikiReposDir = getWikiReposDir();
 
     // Normalize path to use data/ prefix
@@ -147,4 +146,3 @@ export async function POST(request: NextRequest) {
     );
   }
 }
-

@@ -13,11 +13,14 @@
 
 import React, { useState, useCallback } from 'react';
 import { useTheme } from '@/lib/theme-context';
+import type { Theme } from '@/lib/theme-context';
 import {
   useGlobalTasks,
   GlobalTask,
   getTaskTypeShortLabel,
 } from '@/lib/hooks/useGlobalTasks';
+import { TraceViewer } from '@/components/TraceViewer';
+import { adaptTaskTrajectory, summarizeTrajectoryDetails } from '@/types/trace';
 
 interface TaskStatusPanelProps {
   /**
@@ -53,69 +56,15 @@ function formatRelativeTime(dateStr: string): string {
   }
 }
 
-function formatClockTime(dateStr: string): string {
-  try {
-    return new Date(dateStr).toLocaleTimeString([], {
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-    });
-  } catch {
-    return '';
-  }
-}
-
 function getLastTrajectoryTimestamp(task: GlobalTask): string | null {
   const trajectory = task.trajectory || [];
   return trajectory.length > 0 ? trajectory[trajectory.length - 1].timestamp : null;
 }
 
-function summarizeTrajectoryDetails(details?: Record<string, unknown> | null): string {
-  if (!details) return '';
-
-  const parts: string[] = [];
-  const toolCalls = details.tool_call_count;
-  const exploredNodes = details.explored_node_count;
-  const outlineCount = details.outline_count;
-  const completedSections = details.completed_section_count;
-
-  if (typeof toolCalls === 'number' && toolCalls > 0) {
-    parts.push(`${toolCalls} tool calls`);
-  }
-  if (typeof exploredNodes === 'number' && exploredNodes > 0) {
-    parts.push(`${exploredNodes} nodes`);
-  }
-  if (typeof outlineCount === 'number' && outlineCount > 0) {
-    parts.push(`${outlineCount} planned sections`);
-  }
-  if (typeof completedSections === 'number' && completedSections > 0) {
-    parts.push(`${completedSections} finished sections`);
-  }
-
-  return parts.join(' • ');
-}
-
-function extractToolCalls(details?: Record<string, unknown> | null): Array<{ display: string; resultPreview?: string }> {
-  const recentToolCalls = details?.recent_tool_calls;
-  if (!Array.isArray(recentToolCalls)) return [];
-
-  return recentToolCalls.flatMap((call) => {
-    if (!call || typeof call !== 'object') return [];
-
-    const display = typeof call.display === 'string' ? call.display : '';
-    if (!display) return [];
-
-    return [{
-      display,
-      resultPreview: typeof call.result_preview === 'string' ? call.result_preview : undefined,
-    }];
-  });
-}
-
 /**
  * Get status color based on task status.
  */
-function getStatusStyle(status: GlobalTask['status'], theme: string): React.CSSProperties {
+function getStatusStyle(status: GlobalTask['status'], theme: Theme): React.CSSProperties {
   const colors: Record<string, { bg: string; text: string }> = {
     running: { bg: theme === 'dark' ? '#1e3a5f' : '#dbeafe', text: theme === 'dark' ? '#60a5fa' : '#1d4ed8' },
     pending: { bg: theme === 'dark' ? '#422006' : '#fef3c7', text: theme === 'dark' ? '#fbbf24' : '#b45309' },
@@ -169,13 +118,12 @@ function TaskItem({
   task: GlobalTask;
   onCancel: (taskId: string) => void;
   isCancelling: boolean;
-  theme: string;
+  theme: Theme;
 }) {
   const canCancel = task.status === 'running' || task.status === 'pending' || task.status === 'stalled';
   const isActive = task.status === 'running' || task.status === 'pending' || task.status === 'stalled';
   const [showTrajectory, setShowTrajectory] = useState(isActive);
   const trajectory = task.trajectory || [];
-  const recentTrajectory = trajectory.slice(-8);
   const lastTrajectoryTimestamp = getLastTrajectoryTimestamp(task);
   const staleLabel = lastTrajectoryTimestamp ? formatRelativeTime(lastTrajectoryTimestamp) : '';
 
@@ -325,7 +273,7 @@ function TaskItem({
         </div>
       )}
 
-      {recentTrajectory.length > 0 && (
+      {trajectory.length > 0 && (
         <div style={{ marginTop: '10px' }}>
           <button
             onClick={() => setShowTrajectory(prev => !prev)}
@@ -339,7 +287,7 @@ function TaskItem({
               color: theme === 'dark' ? '#93c5fd' : '#2563eb',
             }}
           >
-            {showTrajectory ? 'Hide trajectory' : `Show trajectory (${recentTrajectory.length})`}
+            {showTrajectory ? 'Hide trajectory' : `Show trajectory (${trajectory.length})`}
           </button>
 
           {showTrajectory && (
@@ -347,102 +295,12 @@ function TaskItem({
               marginTop: '10px',
               borderTop: `1px solid ${theme === 'dark' ? '#374151' : '#e5e7eb'}`,
               paddingTop: '10px',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '8px',
             }}>
-              {recentTrajectory.map((event, index) => {
-                const detailSummary = summarizeTrajectoryDetails(event.details);
-                const toolCalls = extractToolCalls(event.details);
-                return (
-                  <div
-                    key={`${event.timestamp}-${index}`}
-                    style={{
-                      display: 'grid',
-                      gridTemplateColumns: '72px 1fr',
-                      gap: '10px',
-                      alignItems: 'start',
-                    }}
-                  >
-                    <div style={{
-                      fontSize: '11px',
-                      color: theme === 'dark' ? '#6b7280' : '#9ca3af',
-                      fontFamily: 'monospace',
-                      paddingTop: '1px',
-                    }}>
-                      {formatClockTime(event.timestamp)}
-                    </div>
-                    <div>
-                      <div style={{
-                        fontSize: '12px',
-                        color: theme === 'dark' ? '#e5e7eb' : '#111827',
-                        lineHeight: 1.4,
-                      }}>
-                        {event.message || event.step || event.status}
-                      </div>
-                      <div style={{
-                        marginTop: '2px',
-                        fontSize: '11px',
-                        color: theme === 'dark' ? '#6b7280' : '#9ca3af',
-                      }}>
-                        {event.status} • {event.progress}%{event.step ? ` • ${event.step}` : ''}
-                      </div>
-                      {detailSummary && (
-                        <div style={{
-                          marginTop: '2px',
-                          fontSize: '11px',
-                          color: theme === 'dark' ? '#9ca3af' : '#6b7280',
-                        }}>
-                          {detailSummary}
-                        </div>
-                      )}
-                      {toolCalls.length > 0 && (
-                        <div style={{
-                          marginTop: '6px',
-                          display: 'flex',
-                          flexDirection: 'column',
-                          gap: '6px',
-                        }}>
-                          {toolCalls.map((toolCall, toolIndex) => (
-                            <div key={`${toolCall.display}-${toolIndex}`}>
-                              <code style={{
-                                fontSize: '11px',
-                                fontFamily: 'monospace',
-                                color: theme === 'dark' ? '#93c5fd' : '#1d4ed8',
-                                background: theme === 'dark' ? 'rgba(59, 130, 246, 0.12)' : 'rgba(29, 78, 216, 0.08)',
-                                padding: '2px 6px',
-                                borderRadius: '6px',
-                                display: 'inline-block',
-                              }}>
-                                {toolCall.display}
-                              </code>
-                              {toolCall.resultPreview && (
-                                <div style={{
-                                  marginTop: '4px',
-                                  fontSize: '11px',
-                                  color: theme === 'dark' ? '#9ca3af' : '#6b7280',
-                                  lineHeight: 1.4,
-                                }}>
-                                  {toolCall.resultPreview}
-                                </div>
-                              )}
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                      {event.error && (
-                        <div style={{
-                          marginTop: '2px',
-                          fontSize: '11px',
-                          color: theme === 'dark' ? '#fca5a5' : '#b91c1c',
-                        }}>
-                          {event.error}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
+              <TraceViewer
+                nodes={adaptTaskTrajectory(trajectory, task.task_id)}
+                theme={theme}
+                maxHeight="400px"
+              />
             </div>
           )}
         </div>
@@ -470,8 +328,8 @@ export function TaskStatusPanel({
     activeTaskCount,
     error,
   } = useGlobalTasks({
-    pollInterval: 5000, // Increased from 2000 to 5000ms to reduce server load
-    stopWhenInactive: true, // Stop polling when no active tasks
+    pollInterval: 3000,
+    stopWhenInactive: true,
     onTaskComplete,
   });
 

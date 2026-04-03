@@ -80,48 +80,50 @@ function OverviewPanelContent({
   const showGraphOverview = showGraphOverviewRef.current;
 
   return (
-    <div style={{ display: 'flex', height: '100%', overflow: 'hidden' }}>
+    <div style={{ display: 'flex', height: '100%', overflow: 'hidden', position: 'relative' }}>
       {overviewData.overviewIndex?.tree && overviewData.overviewIndex.tree.length > 0 && (
-        <div style={{
-          position: 'relative',
-          width: navCollapsed ? 28 : 200,
-          minWidth: navCollapsed ? 28 : 160,
-          flexShrink: 0,
-          transition: 'width 0.15s ease, min-width 0.15s ease',
-          overflow: 'hidden',
-        }}>
-          {!navCollapsed && (
-            <div style={{
-              width: '100%',
-              height: '100%',
-              borderRight: `1px solid ${colors.border}`,
-              overflow: 'auto',
-            }}>
-              <LeftNavigation
-                theme={theme}
-                tree={overviewData.overviewIndex.tree}
-                currentPath={overviewData.currentDocPath}
-                onNavigate={overviewData.handleNavigate}
-                isCollapsed={false}
-                onToggle={() => {}}
-              />
-            </div>
-          )}
+        <>
+          <div style={{
+            width: navCollapsed ? 0 : 200,
+            minWidth: navCollapsed ? 0 : 160,
+            flexShrink: 0,
+            transition: 'width 0.15s ease, min-width 0.15s ease',
+            overflow: 'hidden',
+          }}>
+            {!navCollapsed && (
+              <div style={{
+                width: '100%',
+                height: '100%',
+                borderRight: `1px solid ${colors.border}`,
+                overflow: 'auto',
+              }}>
+                <LeftNavigation
+                  theme={theme}
+                  tree={overviewData.overviewIndex.tree}
+                  currentPath={overviewData.currentDocPath}
+                  onNavigate={overviewData.handleNavigate}
+                  isCollapsed={false}
+                  onToggle={() => {}}
+                />
+              </div>
+            )}
+          </div>
           <button
             onClick={() => setNavCollapsed(c => !c)}
             style={{
-              position: 'absolute', top: 8, right: navCollapsed ? 4 : 0,
-              width: 20, height: 20, padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
-              background: colors.card, border: `1px solid ${colors.border}`, borderRadius: 4,
-              cursor: 'pointer', color: colors.textMuted, fontSize: 10, lineHeight: 1,
-              zIndex: 2,
-              transition: 'right 0.15s ease',
+              position: 'absolute', top: 8, left: navCollapsed ? 4 : 188,
+              width: 24, height: 24, padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+              background: colors.accent, border: 'none', borderRadius: '50%',
+              cursor: 'pointer', color: '#fff', fontSize: 11, lineHeight: 1,
+              zIndex: 50,
+              boxShadow: '0 2px 6px rgba(0,0,0,0.2)',
+              transition: 'left 0.15s ease',
             }}
             title={navCollapsed ? 'Show sidebar' : 'Hide sidebar'}
           >
             {navCollapsed ? '\u25B6' : '\u25C0'}
           </button>
-        </div>
+        </>
       )}
       <div style={{ flex: 1, overflow: 'hidden', minWidth: 0 }}>
         {showGraphOverview ? (

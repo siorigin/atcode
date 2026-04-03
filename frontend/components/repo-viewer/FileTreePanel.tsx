@@ -94,7 +94,6 @@ export function FileTreePanel({
   const { theme } = useTheme();
   const colors = getThemeColors(theme);
   const [searchQuery, setSearchQuery] = useState('');
-  const [branchOpen, setBranchOpen] = useState(false);
 
   const handleSearchChange = useCallback((value: string) => {
     setSearchQuery(value);
@@ -118,10 +117,11 @@ export function FileTreePanel({
       display: 'flex', flexDirection: 'column', height: '100%',
       background: colors.bgSecondary, overflow: 'hidden',
     }}>
-      {/* Branch selector */}
-      <div style={{ padding: '8px 10px', borderBottom: `1px solid ${colors.border}`, flexShrink: 0, position: 'relative' }}>
+      {/* Branch selector - opens git management panel */}
+      <div style={{ padding: '8px 10px', borderBottom: `1px solid ${colors.border}`, flexShrink: 0 }}>
         <button
-          onClick={() => setBranchOpen(!branchOpen)}
+          onClick={() => onBranchChange(currentBranch)}
+          title="Open Git management"
           style={{
             display: 'flex', alignItems: 'center', gap: '6px',
             width: '100%', padding: '5px 10px',
@@ -130,39 +130,17 @@ export function FileTreePanel({
             fontFamily: "'Inter', -apple-system, sans-serif",
             cursor: 'pointer', fontWeight: 500,
           }}
+          onMouseEnter={(e) => { e.currentTarget.style.borderColor = colors.accent; }}
+          onMouseLeave={(e) => { e.currentTarget.style.borderColor = colors.border; }}
         >
           <GitBranchIcon size={13} color={colors.accent} />
           <span style={{ flex: 1, textAlign: 'left', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {currentBranch || 'main'}
           </span>
-          <ChevronRight size={10} color={colors.textMuted} />
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke={colors.textMuted} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="12" cy="12" r="1" /><circle cx="12" cy="5" r="1" /><circle cx="12" cy="19" r="1" />
+          </svg>
         </button>
-        {branchOpen && branches.length > 0 && (
-          <div style={{
-            position: 'absolute', zIndex: 100, left: '10px', right: '10px', marginTop: '4px',
-            background: colors.bg, border: `1px solid ${colors.border}`,
-            borderRadius: '8px', boxShadow: '0 8px 24px rgba(0,0,0,0.3)',
-            maxHeight: '200px', overflow: 'auto',
-          }}>
-            {branches.map(b => (
-              <button
-                key={b.name}
-                onClick={() => { onBranchChange(b.name); setBranchOpen(false); }}
-                style={{
-                  display: 'block', width: '100%', padding: '6px 12px',
-                  background: b.name === currentBranch ? colors.accentBg : 'transparent',
-                  border: 'none', color: b.name === currentBranch ? colors.accent : colors.text,
-                  fontSize: '12px', textAlign: 'left', cursor: 'pointer',
-                  fontFamily: "'Inter', -apple-system, sans-serif",
-                }}
-                onMouseEnter={(e) => { if (b.name !== currentBranch) e.currentTarget.style.background = colors.bgHover; }}
-                onMouseLeave={(e) => { if (b.name !== currentBranch) e.currentTarget.style.background = 'transparent'; }}
-              >
-                {b.name}
-              </button>
-            ))}
-          </div>
-        )}
       </div>
 
       {/* Breadcrumb navigation */}

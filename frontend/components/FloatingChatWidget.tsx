@@ -8,6 +8,7 @@ import { createPortal } from 'react-dom';
 import { useChatStore, CodeBlock } from '@/lib/store';
 import { startStream, stopStream } from '@/lib/chat-stream-manager';
 import { useTheme } from '@/lib/theme-context';
+import type { Theme } from '@/lib/theme-context';
 import { ModelCombobox } from './ModelCombobox';
 import { useModels } from '@/lib/hooks/useModels';
 import { getThemeColors } from '@/lib/theme-colors';
@@ -16,6 +17,8 @@ import { useRepoViewer } from '@/lib/repo-viewer-context';
 import { useDock } from '@/lib/dock-context';
 import { ChatEmptyState } from '@/components/EmptyState';
 import { exportChatToMarkdown, downloadMarkdown, downloadPDF, createExportableHTML, exportWithAllCode } from '@/lib/export-utils';
+import { TraceViewer } from '@/components/TraceViewer';
+import { adaptChatToolTrace, adaptStreamingToolTrace } from '@/types/trace';
 
 /**
  * Fallback copy for non-HTTPS contexts where navigator.clipboard is unavailable.
@@ -67,6 +70,7 @@ const ChatMessage = memo(({
   textDark,
   borderDark,
   accent,
+  theme: messageTheme,
   onAddCodeBlock,
   onNavigateToNode,
   isStreaming,
@@ -84,6 +88,7 @@ const ChatMessage = memo(({
   textDark: string;
   borderDark: string;
   accent: string;
+  theme: Theme;
   onAddCodeBlock?: AddCodeBlockCallback;
   onNavigateToNode?: (qualifiedName: string) => void;
   isStreaming?: boolean;
@@ -100,6 +105,7 @@ const ChatMessage = memo(({
   const [isHovered, setIsHovered] = useState(false);
   const [showToolTrace, setShowToolTrace] = useState(false);
   const toolTrace: import('@/lib/store').ToolTraceItem[] = message.metadata?.toolTrace || [];
+  const contextStats = message.metadata?.contextStats as { total_turns?: number; kept_turns?: number; trimmed?: boolean; approx_tokens?: number; summaries_count?: number } | null;
   // Process markdown to convert [[node]] to {{NODE_LINK:node}} markers for assistant messages
   const processedContent = useMemo(() => 
     message.role === 'assistant' 
@@ -216,6 +222,14 @@ const ChatMessage = memo(({
                     <span style={{ color: textDark, opacity: 0.65 }}>
                       {toolTrace.length} step{toolTrace.length > 1 ? 's' : ''}
                     </span>
+                    {contextStats && (
+                      <span style={{ color: textDark, opacity: 0.5, fontSize: '11px', borderLeft: `1px solid ${borderDark}`, paddingLeft: '8px' }}>
+                        {contextStats.trimmed
+                          ? `${contextStats.kept_turns}/${contextStats.total_turns} turns`
+                          : `${contextStats.total_turns} turn${(contextStats.total_turns || 0) > 1 ? 's' : ''}`}
+                        {` · ~${((contextStats.approx_tokens || 0) / 1000).toFixed(1)}k tokens`}
+                      </span>
+                    )}
                   </span>
                   <span style={{ color: textDark, opacity: 0.65, fontSize: '11px' }}>
                     {showToolTrace ? 'Hide' : 'Show'}
@@ -229,40 +243,12 @@ const ChatMessage = memo(({
                     borderRadius: '10px',
                     border: `1px solid ${borderDark}`,
                     background: bgDark,
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: '6px',
-                    fontSize: '12px',
                   }}>
-                    {toolTrace.map((tc, idx) => (
-                      <div key={`${message.id}-trace-${idx}`} style={{ display: 'flex', gap: '8px', alignItems: 'flex-start' }}>
-                        <span style={{ color: textDark, opacity: 0.6, minWidth: '20px' }}>{idx + 1}.</span>
-                        <div style={{ minWidth: 0 }}>
-                          <div style={{ fontWeight: 600 }}>{tc.tool}</div>
-                          {tc.key_arg && (
-                            <div style={{ color: textDark, opacity: 0.7, wordBreak: 'break-all' }}>{tc.key_arg}</div>
-                          )}
-                          {tc.result && (
-                            <div style={{ color: accent, marginTop: '2px' }}>{tc.result}</div>
-                          )}
-                          {tc.preview && tc.preview.length > 0 && (
-                            <div style={{
-                              marginTop: '3px',
-                              paddingLeft: '8px',
-                              borderLeft: `2px solid ${borderDark}`,
-                              fontSize: '11px',
-                              color: textDark,
-                              opacity: 0.7,
-                              lineHeight: '1.5',
-                            }}>
-                              {(tc.preview as string[]).map((item: string, i: number) => (
-                                <div key={i} style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item}</div>
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    ))}
+                    <TraceViewer
+                      nodes={adaptChatToolTrace(toolTrace, message.id)}
+                      theme={messageTheme}
+                      compact
+                    />
                   </div>
                 )}
               </div>
@@ -2285,6 +2271,7 @@ export function FloatingChatWidget({ repoName, isOpen, onToggle, activeContext, 
                 textDark={textDark}
                 borderDark={borderDark}
                 accent={accent}
+                theme={theme}
                 onAddCodeBlock={handleAddCodeBlock}
                 onNavigateToNode={handleNavigateToNode}
                 isStreaming={isStreaming}
@@ -2386,93 +2373,12 @@ export function FloatingChatWidget({ repoName, isOpen, onToggle, activeContext, 
                       </button>
 
                       {streamToolTraceExpanded && (
-                        <div style={{
-                          display: 'flex',
-                          flexDirection: 'column',
-                          gap: '4px',
-                          padding: '0 10px 10px 10px',
-                          fontSize: '12px',
-                        }}>
-                          {toolCallHistory.map((tc, idx) => {
-                            const isActive = idx === toolCallHistory.length - 1 && currentToolCall;
-                            return (
-                              <div key={idx} style={{
-                                display: 'flex',
-                                alignItems: 'flex-start',
-                                gap: '6px',
-                                color: isActive ? textDark : mutedDark,
-                                opacity: isActive ? 1 : 0.7,
-                                padding: '3px 0',
-                              }}>
-                                {isActive ? (
-                                  <svg
-                                    width="13"
-                                    height="13"
-                                    viewBox="0 0 24 24"
-                                    fill="none"
-                                    stroke="currentColor"
-                                    strokeWidth="2"
-                                    style={{ animation: 'spin 1s linear infinite', flexShrink: 0, marginTop: '1px' }}
-                                  >
-                                    <circle cx="12" cy="12" r="10" strokeOpacity="0.25" />
-                                    <path d="M12 2a10 10 0 0 1 10 10" strokeLinecap="round" />
-                                  </svg>
-                                ) : (
-                                  <svg
-                                    width="13"
-                                    height="13"
-                                    viewBox="0 0 24 24"
-                                    fill="none"
-                                    stroke={tc.result ? colors.accent : mutedDark}
-                                    strokeWidth="2"
-                                    style={{ flexShrink: 0, marginTop: '1px' }}
-                                  >
-                                    {tc.result ? (
-                                      <polyline points="20 6 9 17 4 12" />
-                                    ) : (
-                                      <circle cx="12" cy="12" r="4" />
-                                    )}
-                                  </svg>
-                                )}
-                                <div style={{ minWidth: 0 }}>
-                                  <span style={{ fontWeight: 500 }}>{tc.tool}</span>
-                                  {tc.key_arg && (
-                                    <span style={{
-                                      marginLeft: '4px',
-                                      color: mutedDark,
-                                      fontStyle: 'italic',
-                                      wordBreak: 'break-all',
-                                    }}>
-                                      {tc.key_arg.length > 60 ? tc.key_arg.slice(0, 60) + '...' : tc.key_arg}
-                                    </span>
-                                  )}
-                                  {tc.result && (
-                                    <span style={{
-                                      marginLeft: '6px',
-                                      color: colors.accent,
-                                      fontSize: '11px',
-                                    }}>
-                                      ({tc.result})
-                                    </span>
-                                  )}
-                                  {tc.preview && tc.preview.length > 0 && (
-                                    <div style={{
-                                      marginTop: '2px',
-                                      paddingLeft: '8px',
-                                      borderLeft: `2px solid ${borderDark}`,
-                                      fontSize: '11px',
-                                      color: mutedDark,
-                                      lineHeight: '1.4',
-                                    }}>
-                                      {tc.preview.map((item: string, i: number) => (
-                                        <div key={i} style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item}</div>
-                                      ))}
-                                    </div>
-                                  )}
-                                </div>
-                              </div>
-                            );
-                          })}
+                        <div style={{ padding: '0 10px 10px 10px' }}>
+                          <TraceViewer
+                            nodes={adaptStreamingToolTrace(toolCallHistory, currentToolCall, session?.id || '')}
+                            theme={theme}
+                            compact
+                          />
                         </div>
                       )}
                     </div>

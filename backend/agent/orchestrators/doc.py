@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
+import uuid
 
 from agent.llm import create_model
 from agent.tools.code_tools import (
@@ -46,9 +47,11 @@ from loguru import logger
 from typing_extensions import TypedDict
 
 from .shared import (
+    _get_tool_call_id,
     clean_messages_for_inheritance,
     extract_markdown_headings,
     generate_anchor,
+    greedy_split_tool_names,
     invoke_with_retry,
     last_value,
     max_value,
@@ -77,30 +80,30 @@ DEPTH_TO_HEADING = {
 # - Minimal code reading, mostly graph exploration
 # - Chat model handles detailed user questions
 OVERVIEW_MODE_TOOL_BUDGETS = {
-    0: 40,  # Root level: discover structure and major components
-    1: 30,  # Section level: understand key relationships
-    2: 30,  # Subsection level: minimal exploration
-    3: 10,  # Deep level: almost none
+    0: 100,  # Root level: discover structure and major components
+    1: 80,  # Section level: understand key relationships
+    2: 40,  # Subsection level: focused exploration
+    3: 20,  # Deep level: minimal exploration
 }
 
 # Detailed mode: Comprehensive documentation (original behavior)
 DETAILED_MODE_TOOL_BUDGETS = {
-    0: 40,  # Root level: thorough exploration
-    1: 30,  # Section level: moderate exploration
-    2: 30,  # Subsection level: focused exploration
-    3: 30,  # Deep level: minimal exploration
+    0: 100,  # Root level: thorough exploration
+    1: 80,  # Section level: moderate exploration
+    2: 40,  # Subsection level: focused exploration
+    3: 20,  # Deep level: minimal exploration
 }
 
 # Default to overview mode for efficiency
 DEFAULT_TOOL_BUDGETS = OVERVIEW_MODE_TOOL_BUDGETS
 
-# Context extraction settings (optimized for overview mode)
+# Context extraction settings
 # Trigger extraction after this many tool calls
 TOOL_CALL_EXTRACTION_THRESHOLD = 20
 # Keep the most recent N tool messages uncompressed (for continuity)
-KEEP_RECENT_TOOL_MESSAGES = 10
+KEEP_RECENT_TOOL_MESSAGES = 5
 # Number of old tool messages to process in each extraction round
-MESSAGES_TO_EXTRACT_PER_ROUND = 10
+MESSAGES_TO_EXTRACT_PER_ROUND = 15
 # Token threshold for auto-keep (small outputs not worth extracting)
 AUTO_KEEP_TOKEN_THRESHOLD = 300
 TOOL_CALL_XML_PATTERN = re.compile(
@@ -141,7 +144,7 @@ def _extract_tool_call_key(tool_name: str, tool_args: Any, tool_call_id: str | N
     return f"{tool_name}:{_safe_json_dumps(tool_args)}"
 
 
-def _summarize_tool_args(tool_args: Any, max_items: int = 3, max_value_len: int = 60) -> str:
+def _summarize_tool_args(tool_args: Any, max_items: int = 3, max_value_len: int = 150) -> str:
     """Render a compact tool argument preview."""
     if not isinstance(tool_args, dict) or not tool_args:
         return ""
@@ -1161,6 +1164,7 @@ Extract and summarize the information from the parent's exploration that is RELE
 3. For small outputs (<500 tokens): Consider KEEP_FULL if potentially useful
 4. Be selective with KEEP_FULL - too many will bloat context
 5. For EXTRACT_INFO: Capture qualified names, file paths, key relationships, patterns discovered
+6. **CRITICAL**: Keep extracted_info concise (max 500 tokens / ~2000 chars). Focus on: discovered node names, file paths, key relationships. Omit verbose descriptions and full code snippets.
 
 Please provide your evaluation:"""
 
@@ -1599,6 +1603,7 @@ You may need to explore further to fill in gaps or verify details.
                 response = await invoke_with_retry(
                     llm_with_tools, messages, label=f"agent_node(depth={depth})",
                     config=settings.active_llm_config,
+                    tools=all_tools,
                 )
                 # IMPORTANT: If we added a SystemMessage, include it in the return
                 # so it gets persisted to state for force_generate_node to use
@@ -1610,7 +1615,27 @@ You may need to explore further to fill in gaps or verify details.
                 return {"messages": [response]}
             except Exception as e:
                 logger.error(f"Agent node failed at depth {depth} (after retries): {e}")
-                # Return error response
+                tool_count = state.get("tool_call_count", 0)
+                if tool_count > 0:
+                    # We have exploration context — return a clean AIMessage
+                    # so the router sends us to force_generate, which will
+                    # synthesise documentation from the existing tool results.
+                    logger.info(
+                        f"Agent node failed but has {tool_count} tool calls of context, "
+                        f"routing to force_generate to salvage exploration results"
+                    )
+                    return {
+                        "messages": [
+                            AIMessage(
+                                content=(
+                                    f"LLM invocation failed ({e}). "
+                                    "I have exploration context from previous tool calls. "
+                                    "Proceeding to generate documentation from existing results."
+                                )
+                            )
+                        ]
+                    }
+                # No exploration context at all — nothing to salvage
                 return {
                     "messages": [
                         AIMessage(
@@ -1627,14 +1652,44 @@ You may need to explore further to fill in gaps or verify details.
             Actual context extraction is handled by extract_context_node via routing.
             """
             try:
-                # Validate tool names before execution to catch LLM hallucinations
-                # like "find_nodesfind_nodes" (concatenated tool names)
+                # Fix concatenated tool names (e.g. "find_nodesfind_nodes")
+                # before execution, instead of just rejecting them
                 messages = state.get("messages", [])
                 last_msg = messages[-1] if messages else None
                 if isinstance(last_msg, AIMessage) and getattr(last_msg, "tool_calls", None):
                     valid_tool_names = {t.name for t in all_tools}
+                    fixed_calls: list[dict[str, Any]] = []
+                    changed = False
+
                     for tc in last_msg.tool_calls:
-                        if tc["name"] not in valid_tool_names:
+                        if tc["name"] in valid_tool_names:
+                            fixed_calls.append(tc)
+                            continue
+
+                        # Try splitting concatenated name
+                        split_names = greedy_split_tool_names(tc["name"], valid_tool_names)
+                        if split_names:
+                            changed = True
+                            merged_args = tc.get("args", {})
+                            logger.info(
+                                f"Splitting concatenated tool call '{tc['name']}' → {split_names}"
+                            )
+                            # Build param sets per tool from schemas
+                            tool_schemas: dict[str, set[str]] = {}
+                            for t in all_tools:
+                                if t.name in split_names:
+                                    schema = t.args_schema.schema() if hasattr(t, "args_schema") and t.args_schema else {}
+                                    tool_schemas[t.name] = set(schema.get("properties", {}).keys())
+
+                            for sub_name in split_names:
+                                expected = tool_schemas.get(sub_name, set())
+                                fixed_calls.append({
+                                    "name": sub_name,
+                                    "args": {k: v for k, v in merged_args.items() if k in expected},
+                                    "id": f"call_{uuid.uuid4().hex[:24]}",
+                                    "type": "tool_call",
+                                })
+                        else:
                             logger.warning(
                                 f"Invalid tool call: '{tc['name']}' (not in {sorted(valid_tool_names)}), returning error"
                             )
@@ -1652,7 +1707,27 @@ You may need to explore further to fill in gaps or verify details.
                                 "need_extraction": False,
                             }
 
+                    if changed:
+                        # Rebuild the AIMessage with corrected tool_calls
+                        new_msg = AIMessage(
+                            content=last_msg.content,
+                            tool_calls=fixed_calls,
+                            response_metadata=getattr(last_msg, "response_metadata", {}),
+                            id=last_msg.id,
+                        )
+                        state = {**state, "messages": messages[:-1] + [new_msg]}
+
                 result = await tool_node.ainvoke(state)
+
+                # If we fixed the AIMessage, include it in the result so the
+                # graph state gets the corrected tool_calls (same ID = in-place
+                # replacement via add_messages reducer).  Without this, the
+                # graph keeps the original concatenated AIMessage while the
+                # ToolMessages carry the new split tool_call_ids, causing
+                # "unexpected tool_use_id" errors on the next LLM call.
+                if changed:
+                    result_messages = result.get("messages", [])
+                    result["messages"] = [new_msg] + result_messages
 
                 # Track tool calls
                 tool_count = state.get("tool_call_count", 0)
@@ -2500,17 +2575,16 @@ You may need to explore further to fill in gaps or verify details.
 
                 # Check for tool calls
                 if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-                    # Reserve last 25% of budget for documentation generation.
-                    # Force doc generation at 75% of budget to improve efficiency
-                    # and leave more context window for high-quality output with
-                    # dense [[links]], proper diagrams, and comprehensive content.
-                    budget_threshold = int(max_tools * 0.75)
+                    # Reserve last few calls for documentation generation.
+                    # With aggressive context extraction, we can safely use ~94%
+                    # of the budget for exploration before forcing generation.
+                    budget_threshold = max_tools - 5
 
                     if tool_count < max_tools:
                         # If approaching budget limit, check if we should force doc generation
                         if tool_count >= budget_threshold:
                             logger.warning(
-                                f"Tool budget at 75% ({tool_count}/{max_tools}, threshold={budget_threshold}) at depth {depth}, forcing documentation generation"
+                                f"Tool budget near limit ({tool_count}/{max_tools}, threshold={budget_threshold}) at depth {depth}, forcing documentation generation"
                             )
                             return "force_generate"
                         return "tools"
@@ -2523,6 +2597,13 @@ You may need to explore further to fill in gaps or verify details.
                 # If substantial content, go to decide
                 if len(content) > 500:
                     return "decide"
+
+                # LLM failed but we have exploration context — salvage it
+                if tool_count > 0:
+                    logger.info(
+                        f"Agent returned short content with {tool_count} tool calls, routing to force_generate"
+                    )
+                    return "force_generate"
 
             # After tool execution, back to agent
             if isinstance(last_msg, ToolMessage):
@@ -2556,19 +2637,6 @@ You may need to explore further to fill in gaps or verify details.
             # This prevents LLM parsing errors when the last AIMessage has tool_calls
             # but no corresponding ToolMessage response
             cleaned_messages = []
-
-            def _get_tool_call_id(tc) -> str:
-                """
-                Helper to robustly extract a tool_call id from either dicts or objects.
-                LangChain / OpenAI tool_calls can be dicts or objects with .id / .tool_call_id.
-                """
-                if tc is None:
-                    return None
-                # Dict-style tool call
-                if isinstance(tc, dict):
-                    return tc.get("id") or tc.get("tool_call_id")
-                # Object-style tool call (e.g. OpenAI tool call objects)
-                return getattr(tc, "id", None) or getattr(tc, "tool_call_id", None)
 
             for i, msg in enumerate(messages):
                 if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
@@ -3572,6 +3640,32 @@ If generating, start with <Doc>True</Doc> followed by markdown content.
             raise
         except Exception as e:
             logger.exception(f"Documentation generation failed: {e}")
+            # Try to salvage partial results if we have any
+            if final_state and (
+                final_state.get("child_results")
+                or final_state.get("generated_content")
+            ):
+                logger.info(
+                    "Attempting to save partial results from crashed generation"
+                )
+                try:
+                    index_data = await self._write_documentation(
+                        final_state,
+                        repo_name,
+                        wiki_doc_path,
+                    )
+                    yield {
+                        "type": "partial",
+                        "content": index_data,
+                        "progress": 90,
+                        "step": "partial_save",
+                        "details": {
+                            "phase": "partial_save",
+                            "error": str(e),
+                        },
+                    }
+                except Exception as write_err:
+                    logger.error(f"Failed to save partial results: {write_err}")
             yield {"type": "error", "content": str(e)}
 
     async def stream_resume(

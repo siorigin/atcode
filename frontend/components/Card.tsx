@@ -573,6 +573,19 @@ function RepoCardContent({
                   <span style={{ opacity: 0.7 }}> · {graphRelationshipCount.toLocaleString()} {t('card.edges')}</span>
                 )}
               </span>
+              {syncEnabled && (
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', marginLeft: '4px', opacity: 0.7 }}>
+                  <span style={{ fontSize: '11px' }}>·</span>
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke={colors.accent} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <polyline points="23 4 23 10 17 10"/>
+                    <polyline points="1 20 1 14 7 14"/>
+                    <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                  </svg>
+                  <span style={{ fontSize: '11px', fontWeight: '500', color: colors.accent }}>
+                    {t('card.syncEnabled') || 'Sync'}
+                  </span>
+                </span>
+              )}
             </>
           ) : (
             <>
@@ -598,35 +611,6 @@ function RepoCardContent({
             </>
           )}
         </div>
-
-        {/* Sync status indicator */}
-        {syncEnabled && (
-          <div style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: '6px',
-            fontSize: '12px',
-            color: colors.textMuted,
-            padding: '4px 0',
-          }}>
-            <span style={{
-              width: '6px',
-              height: '6px',
-              borderRadius: '50%',
-              background: colors.accent,
-              boxShadow: `0 0 4px ${colors.accentBorder}`,
-              animation: 'pulse 2s ease-in-out infinite',
-            }} />
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ opacity: 0.7 }}>
-              <polyline points="23 4 23 10 17 10"/>
-              <polyline points="1 20 1 14 7 14"/>
-              <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
-            </svg>
-            <span style={{ fontWeight: '500', fontSize: '11px' }}>
-              {t('card.syncEnabled') || 'Sync'}
-            </span>
-          </div>
-        )}
 
         {/* Last updated date */}
         {lastUpdated && (
