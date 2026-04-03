@@ -7,9 +7,9 @@
 
 **AI 代码知识图谱 —— 代码理解、图谱检索与 Agent 工作流**
 
-*将代码仓库转化为可查询的 AST 知识图谱，让 AI 沿着结构、调用链和依赖关系理解代码，而非仅依赖文本切片。*
+*将代码仓库转化为可查询的 AST 知识图谱,让 AI 沿着结构、调用链和依赖关系理解代码，而非仅依赖文本切片。*
 
-<video src="./docs/display.mp4" controls width="800"></video>
+https://github.com/user-attachments/assets/2b5cdaf7-1910-45e0-a2e8-4c9154dbe6b1
 
 <p>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg?style=for-the-badge&labelColor=1a1a2e"></a>
