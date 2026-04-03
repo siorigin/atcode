@@ -11,6 +11,27 @@
 
 https://github.com/user-attachments/assets/2b5cdaf7-1910-45e0-a2e8-4c9154dbe6b1
 
+<details>
+<summary>📂 仓库浏览器</summary>
+
+https://github.com/user-attachments/assets/e3dc8075-4607-414a-935a-0922d997320a
+
+</details>
+
+<details>
+<summary>📄 MCP 论文阅读</summary>
+
+https://github.com/user-attachments/assets/2b1b40bc-8cd5-4633-8219-37d11724fac2
+
+</details>
+
+<details>
+<summary>🔍 交互式论文分析</summary>
+
+https://github.com/user-attachments/assets/cfd52ced-4f4f-4e5a-8ff1-f755a033f1ae
+
+</details>
+
 <p>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg?style=for-the-badge&labelColor=1a1a2e"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.12+-4ecdc4?style=for-the-badge&logo=python&logoColor=white&labelColor=1a1a2e"></a>
